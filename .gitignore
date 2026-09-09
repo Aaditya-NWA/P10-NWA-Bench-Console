@@ -1,0 +1,85 @@
+# ================================================================
+#  NWA Bench Console — .gitignore
+#
+#  Tracks: source code (backend, frontend, esp32, tools), the
+#          dependency manifests, brand assets, and README.md.
+#  Ignores: everything else — dependencies, build output, test data,
+#           operator recordings, working notes, and all other .md.
+# ================================================================
+
+# ── Documentation ────────────────────────────────────────────────
+# Only README.md ships. Working notes and internal docs stay local.
+*.md
+!README.md
+improvements.txt
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+
+# ── Node / npm ───────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+coverage/
+*.local
+
+# ── Environment & Secrets ────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── IDE & Editor ─────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Test data & operator recordings ──────────────────────────────
+# Runs are written to <Documents>/NWA Bench Console/, not here, but
+# these patterns stop a stray capture or export being committed.
+*.csv
+*.jsonl
+*.xlsx
+*.bin
+recordings/
+
+# ── Unused source artwork ────────────────────────────────────────
+# The icon actually shipped lives in frontend/public/. This one is a
+# 1.7 MB generated image with a watermark baked in and is referenced
+# nowhere — kept on disk, not in the repo.
+public/Gemini_Generated_Image_*.png
+
+# ── ESP32 / PlatformIO build ─────────────────────────────────────
+esp32/.pio/
+esp32/build/
+esp32/managed_components/
+sdkconfig
+sdkconfig.old
+
+# ── Miscellaneous ───────────────────────────────────────────────
+CLAUDE.md
+DEPLOYMENT.md

@@ -1,0 +1,9 @@
+bash
+cd "C:\Users\Aditya Kulkarni\workspace\thrustbench"
+
+Then:
+
+bash
+idf.py build
+idf.py -p COM6 flash
+idf.py -p COM6 monitor

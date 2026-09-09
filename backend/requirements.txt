@@ -1,0 +1,10 @@
+fastapi==0.111.0         # Web framework with built-in WebSocket support
+uvicorn[standard]==0.29.0  # ASGI server to run FastAPI
+pyserial==3.5            # USB serial communication with ESP32
+websockets==12.0         # WebSocket protocol support (used by uvicorn internally)
+openpyxl==3.1.2          # Excel (.xlsx) file generation for data logging export
+pandas==2.2.2            # CSV/XLSX parsing + plateau detection for Tab 2 analysis
+numpy==1.26.4            # Numeric ops for Tab 2 analysis
+matplotlib==3.9.0        # Renders the Thrust/Torque vs RPM comparison charts (Tab 2)
+Pillow==10.4.0           # Required by openpyxl to embed chart images in the export sheet
+python-multipart==0.0.9  # Required by FastAPI to parse multipart file uploads (Tab 2)
