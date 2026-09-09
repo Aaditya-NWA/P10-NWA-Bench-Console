@@ -8,14 +8,13 @@ import { checkForUpdate, installUpdate, isDesktop, onUpdateProgress } from "../d
  *
  * Nothing here happens on its own. The app never checks for updates in
  * the background; it asks the release channel only when the operator
- * presses the button. That is what allows the repository to be private
- * between releases — the update endpoint has to be reachable in the
- * moment of the click, rather than permanently.
+ * presses the button — so a bench machine makes no background network
+ * requests, and no update prompt can interrupt a run.
  *
- * The consequence, and the reason "unreachable" is its own state: while
- * the repository is private, a check answers exactly as it would if
- * nothing had ever been published. Reporting that as "up to date" would
- * hide a closed release window, so it gets its own wording.
+ * "Unreachable" is its own state because a 404 from the release channel
+ * is indistinguishable from one that has published nothing. Reporting
+ * that as "up to date" would turn a connectivity failure into false
+ * reassurance.
  */
 export default function UpdatesPanel() {
   const [checking, setChecking]   = useState(false);

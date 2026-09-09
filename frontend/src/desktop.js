@@ -23,14 +23,14 @@ export function isDesktop() {
 /**
  * Ask the release channel whether a newer version is published.
  *
- * Only ever called from an explicit operator click — nothing polls. That
- * is what lets the repository stay private between releases: the update
- * endpoint has to be reachable in this moment, not permanently.
+ * Only ever called from an explicit operator click — nothing polls, so a
+ * bench machine makes no background network requests and no update can
+ * interrupt a session.
  *
  * Resolves to { state, current_version, version, title, size_bytes, detail }
  * where state is one of UPDATE_STATE. Never rejects for an unreachable
- * channel — that arrives as state "unreachable", because a private repo
- * and a network outage are normal conditions here, not errors.
+ * channel — that arrives as state "unreachable", because being offline is
+ * a normal condition here, not an error.
  */
 export async function checkForUpdate() {
   if (!isDesktop()) {

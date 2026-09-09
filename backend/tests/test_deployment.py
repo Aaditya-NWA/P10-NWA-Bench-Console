@@ -129,11 +129,10 @@ def test_the_shell_exposes_manual_update_commands():
 def test_the_shell_never_checks_for_updates_on_its_own():
     """No timer, no launch check — the operator's click is the only trigger.
 
-    This is what lets the release repository stay private between
-    releases: the update endpoint has to be reachable at the moment of
-    the click rather than permanently. A reintroduced background poll
-    would quietly restore the always-public requirement, and nothing
-    else in the app would look different.
+    A bench machine should make no unprompted network requests, and no
+    update should be able to interrupt a run. A reintroduced background
+    poll would undo both, and nothing else in the app would look
+    different — the failure is entirely invisible from the UI.
     """
     src = MAIN_RS.read_text(encoding="utf-8")
     for banned in ("UPDATE_CHECK_INTERVAL", "FIRST_UPDATE_CHECK_DELAY",

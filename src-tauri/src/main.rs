@@ -262,12 +262,19 @@ fn stop_sidecar_gracefully(sidecar: &Sidecar) -> bool {
 // ================================================================
 // UPDATES — checked only when the operator asks
 // ================================================================
-// Deliberately manual. The earlier design polled GitHub every 3 days,
-// which requires the repository to be public *permanently*. Checking
-// only on an explicit click means the release channel has to be
-// reachable only in the moment the operator presses the button, so the
-// repo can sit private between releases and be opened for the window in
-// which operators are told to update.
+// Deliberately manual. The earlier design polled GitHub every 3 days.
+//
+// It was first made on-demand so the repository could sit private
+// between releases; that plan was dropped, because GitHub Actions is
+// free for public repos and metered for private ones, and going private
+// would have billed the very Windows builds that produce the releases.
+// The repo stays public (DEPLOYMENT.md §6, §12 O4).
+//
+// The manual design was kept regardless, on reasons that never depended
+// on visibility: nothing reaches the network in the background from a
+// bench machine, and no update prompt can interrupt a session — the
+// operator picks the moment, the same instinct that refuses calibration
+// writes mid-profile.
 //
 // What has NOT changed is the safety rule (DEPLOYMENT.md §6): an update
 // replaces the process that owns the serial port and the throttle cut,
@@ -294,11 +301,12 @@ struct UpdateProgress {
 ///   "none"        — the manifest was read and we are current
 ///   "unreachable" — the manifest could not be read at all
 ///
-/// That last one is the private-repo case. GitHub answers 404 for a
-/// private repo *and* for one with no releases yet, so the two are
-/// indistinguishable from here — but both are very much distinguishable
-/// from "you are up to date", and reporting them as that would make a
-/// closed release window look like a working one.
+/// GitHub answers 404 both for a repo the caller cannot see and for one
+/// with no releases yet, so "unreachable" cannot tell those apart — but
+/// it is very much distinguishable from "you are up to date", and
+/// reporting it as that would turn a real connectivity failure into
+/// false reassurance. With the repo public this should be rare, which is
+/// exactly why it is worth naming when it happens.
 #[derive(Default, serde::Serialize)]
 struct UpdateInfo {
     state: String,
