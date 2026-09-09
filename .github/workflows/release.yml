@@ -96,25 +96,42 @@ jobs:
       - name: Install root dependencies
         run: npm ci
 
-      # The Updates panel shows this as the update's title, so it is the
-      # one line an operator reads before deciding to install.
+      # The Updates panel shows this as the update's title: the one line
+      # an operator reads before deciding to install. It comes from the
+      # annotated tag's message, which is written for the release, rather
+      # than the last commit subject, which is whatever happened to land
+      # last (at v1.0.0 that was a formatting fix).
       #
-      # Preferred source is the annotated tag's own message, which is
-      # written deliberately for the release. The last commit subject is
-      # only a fallback: it is whatever happened to land last, which for
-      # a release is often a formatting or version-bump commit and reads
-      # as noise to an operator deciding whether to install.
+      # The explicit re-fetch is required, not belt-and-braces.
+      # actions/checkout resolves the tag and then re-fetches it as
+      # `+<sha>:refs/tags/<tag>`, which force-replaces the annotated tag
+      # object with a LIGHTWEIGHT tag pointing straight at the commit.
+      # The tag message is gone by the time any later step runs, and
+      # `%(contents:subject)` then yields the commit subject instead —
+      # silently, with no error and a plausible-looking string.
       - name: Read the release note from the tag
         id: commit
         shell: bash
         run: |
-          subject="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:subject)')"
-          if [ -z "$subject" ]; then
-            subject="$(git log -1 --pretty=%s)"
-            echo "No annotated tag message; falling back to the commit subject."
+          tag="${GITHUB_REF_NAME}"
+          # Restore the real tag object that checkout clobbered.
+          git fetch --force --no-recurse-submodules origin "refs/tags/${tag}:refs/tags/${tag}" || true
+
+          subject=""
+          if [ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null)" = "tag" ]; then
+            subject="$(git tag -l --format='%(contents:subject)' "${tag}")"
+            echo "Read release note from the annotated tag."
+          else
+            echo "::warning::${tag} is a lightweight tag - no tag message to read."
           fi
-          echo "Release note: $subject"
-          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+
+          if [ -z "${subject}" ]; then
+            subject="$(git log -1 --pretty=%s)"
+            echo "::warning::Falling back to the commit subject; this is what operators will see as the update title."
+          fi
+
+          echo "Release note: ${subject}"
+          echo "subject=${subject}" >> "$GITHUB_OUTPUT"
 
       - name: Build, sign, and draft the release
         uses: tauri-apps/tauri-action@v0
