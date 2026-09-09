@@ -30,6 +30,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Annotated tag objects are needed to read the release note out
+          # of the tag message below; a shallow checkout of the tag ref
+          # does not reliably bring the tag object itself.
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -92,14 +97,23 @@ jobs:
         run: npm ci
 
       # The Updates panel shows this as the update's title, so it is the
-      # one line an operator reads before deciding to install. Taken from
-      # the tagged commit's subject rather than written by hand, so it
-      # cannot drift from what actually shipped.
-      - name: Read the tagged commit's subject line
+      # one line an operator reads before deciding to install.
+      #
+      # Preferred source is the annotated tag's own message, which is
+      # written deliberately for the release. The last commit subject is
+      # only a fallback: it is whatever happened to land last, which for
+      # a release is often a formatting or version-bump commit and reads
+      # as noise to an operator deciding whether to install.
+      - name: Read the release note from the tag
         id: commit
         shell: bash
         run: |
-          subject="$(git log -1 --pretty=%s)"
+          subject="$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:subject)')"
+          if [ -z "$subject" ]; then
+            subject="$(git log -1 --pretty=%s)"
+            echo "No annotated tag message; falling back to the commit subject."
+          fi
+          echo "Release note: $subject"
           echo "subject=$subject" >> "$GITHUB_OUTPUT"
 
       - name: Build, sign, and draft the release
