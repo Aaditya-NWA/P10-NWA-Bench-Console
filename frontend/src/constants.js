@@ -3,8 +3,24 @@
 // a previous release) lives here so there is exactly one spelling of it.
 
 // ── Backend address ───────────────────────────────────────────────
-export const API_BASE = "http://localhost:8000";
-export const WS_BASE  = "ws://localhost:8000/ws";
+// Absolute, not relative: under the Tauri desktop shell the dashboard is
+// loaded from the app's own bundled assets, so it is NOT same-origin
+// with the backend and a relative path would resolve to the app itself.
+//
+// 127.0.0.1 rather than "localhost" on purpose. The sidecar binds
+// 127.0.0.1 explicitly, and on Windows "localhost" often resolves to
+// ::1 (IPv6) first — which nothing is listening on, so the request fails
+// with a connection error that looks exactly like "the backend is down".
+//
+// Overridable at build time (VITE_API_HOST / VITE_API_PORT) so a dev
+// server, a LAN build, or a second instance on another port needs no
+// code edit. The port must match backend/constants.py's DEFAULT_PORT and
+// the BACKEND_PORT constant in src-tauri/src/main.rs.
+const API_HOST = import.meta.env?.VITE_API_HOST || "127.0.0.1";
+const API_PORT = import.meta.env?.VITE_API_PORT || "8000";
+
+export const API_BASE = `http://${API_HOST}:${API_PORT}`;
+export const WS_BASE  = `ws://${API_HOST}:${API_PORT}/ws`;
 
 // ── Browser storage keys ──────────────────────────────────────────
 export const STORAGE_TOKEN = "nwa-bench-token";

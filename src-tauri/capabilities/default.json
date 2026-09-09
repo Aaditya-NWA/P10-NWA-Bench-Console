@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the bench console window. Deliberately narrow: the dashboard is a local web app that talks to the sidecar over HTTP, so it needs no filesystem, shell, or network capabilities of its own. Everything here exists for the updater flow.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-ask",
+    "dialog:allow-message",
+    "process:allow-restart",
+    "process:allow-exit",
+    "updater:default"
+  ]
+}

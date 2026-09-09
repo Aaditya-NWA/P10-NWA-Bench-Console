@@ -1,0 +1,122 @@
+# Release pipeline (DEPLOYMENT.md §8).
+#
+# Triggered by pushing a version tag. Runs the test suites, builds the
+# desktop app, and creates a DRAFT GitHub Release carrying the installer,
+# its Ed25519 signature, and the latest.json manifest the updater reads.
+#
+# The release is deliberately left as a draft. Publishing it is what makes
+# every installed copy see the update, so that stays a separate, deliberate,
+# human step — not something a git push does.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs build and test without producing a release, which is the
+  # cheap way to find out that a dependency broke the frozen build.
+  workflow_dispatch:
+
+permissions:
+  contents: write        # Required to create the release
+
+jobs:
+  release:
+    # Windows-only on purpose: the COM-port handling and the WebView2
+    # dependency are Windows-specific and nothing here has been tested
+    # elsewhere (DEPLOYMENT.md §13).
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"      # Matches the development venv
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Rust builds dominate the runtime here; without a cache every
+      # release recompiles the whole Tauri dependency tree.
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run backend tests
+        working-directory: backend
+        run: python -m pytest tests -q
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Freeze the backend
+        working-directory: backend
+        run: >
+          python -m PyInstaller thrustbench-backend.spec --noconfirm
+          --distpath dist_sidecar --workpath build_sidecar
+
+      # Staged rather than referenced in place: tauri.conf.json's resource
+      # path has to live under src-tauri.
+      - name: Stage the backend for Tauri
+        shell: pwsh
+        run: |
+          $staged = "src-tauri/resources/backend"
+          if (Test-Path $staged) { Remove-Item $staged -Recurse -Force }
+          New-Item -ItemType Directory -Path $staged -Force | Out-Null
+          Copy-Item "backend/dist_sidecar/thrustbench-backend/*" $staged -Recurse -Force
+          if (-not (Test-Path "$staged/thrustbench-backend.exe")) {
+            throw "Staging failed - thrustbench-backend.exe is missing"
+          }
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Build, sign, and draft the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Without these the build still produces an installer, but no
+          # .sig — and an unsigned artifact is one every installed copy
+          # refuses as an update (§6).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "NWA Bench Console ${{ github.ref_name }}"
+          releaseBody: |
+            Desktop build of the NWA Bench Console.
+
+            Installed copies check for updates on their own schedule and
+            will offer this version — but never while the ESP32 is
+            connected or a run is in progress.
+
+            First install: run the setup .exe. Windows SmartScreen will
+            warn unless the signing certificate has been trusted on this
+            machine (see DEPLOYMENT.md §7); "More info" then "Run anyway"
+            is safe here.
+          # Draft on purpose — see the header.
+          releaseDraft: true
+          prerelease: false
+          # Emits latest.json alongside the installer; the updater has
+          # nothing to read without it.
+          includeUpdaterJson: true

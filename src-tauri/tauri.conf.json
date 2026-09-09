@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NWA Bench Console",
+  "version": "1.0.0",
+  "identifier": "com.nauticalwings.benchconsole",
+  "build": {
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "NWA Bench Console",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' http://127.0.0.1:8000 ws://127.0.0.1:8000 http://localhost:8000 ws://localhost:8000"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Nautical Wings Aerospace",
+    "copyright": "Nautical Wings Aerospace",
+    "category": "Utility",
+    "shortDescription": "100 kgf thrust stand console",
+    "longDescription": "Dashboard for the Nautical Wings Aerospace 100 kgf flight thrust test stand: live telemetry, throttle profiles, and data analysis.",
+    "resources": {
+      "resources/backend/": "backend/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English"
+        ]
+      }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBQjk3M0E4REVBRjVBRTgKUldUb1dxL2VxSE81K21WaGpwRkk4WlRlbjRrS0w0Z3VITi81TXM4cHAyWFVqcUtJaSs3OWxVWi8K",
+      "endpoints": [
+        "https://github.com/Aaditya-NWA/P10-NWA-Bench-Console/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

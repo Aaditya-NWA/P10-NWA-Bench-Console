@@ -1,0 +1,40 @@
+[package]
+name = "nwa-bench-console"
+version = "1.0.0"
+description = "NWA Bench Console — 100 kgf flight thrust test stand"
+authors = ["Nautical Wings Aerospace"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Loopback only — every request this makes is plain HTTP to 127.0.0.1,
+# so the TLS stack is dead weight here. The updater plugin brings its
+# own client for the HTTPS calls to GitHub.
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+
+# The shutdown token. getrandom pulls from the OS CSPRNG; a predictable
+# token would let any local process stop a running test.
+getrandom = "0.2"
+
+[features]
+# Tauri's default release profile strips symbols; keep this explicit so a
+# `cargo build` outside `tauri build` behaves the same way.
+default = []
+
+[profile.release]
+panic = "abort"     # A panic in the shell must not unwind past the sidecar teardown
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

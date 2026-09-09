@@ -122,7 +122,15 @@ def test_every_mutating_route_declares_an_auth_dependency():
     """
     exempt = {"/auth/status", "/auth/setup", "/auth/login", "/auth/logout",
               "/auth/me", "/auth/users", "/auth/password",
-              "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+              "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc",
+              # Called by the Tauri shell, which is not a signed-in
+              # operator and has no way to become one — it polls /health
+              # before any account may even exist, and asks /shutdown to
+              # stop gracefully so the throttle cut still runs. /shutdown
+              # is guarded by its own per-launch token instead; that
+              # guard is pinned in test_deployment.py, so this exemption
+              # is a different check, not an absent one.
+              "/health", "/shutdown"}
 
     unprotected = []
     for route in main.app.routes:

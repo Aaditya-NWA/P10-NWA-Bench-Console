@@ -5,6 +5,37 @@
 
 from __future__ import annotations
 
+# ── Version ───────────────────────────────────────────────────────
+# The single source of truth for the backend's version. Hand-duplicated
+# in frontend/package.json, src-tauri/tauri.conf.json and Cargo.toml —
+# tests/test_deployment.py fails the build if they drift apart, because
+# the updater compares versions and a stale one means installed copies
+# either miss a release or reinstall one they already have.
+APP_VERSION = "1.0.0"
+
+# ── Desktop shell (Tauri sidecar) ─────────────────────────────────
+# The backend runs as a child process of the Rust shell, which needs a
+# way to (a) know when it is actually accepting connections and (b) ask
+# it to stop *gracefully*. Killing it outright skips the shutdown
+# handler, and that handler is what aborts a running profile and writes
+# THR_MIN to the ESC — see DEPLOYMENT.md §9. Everything below exists to
+# keep that write reachable.
+DEFAULT_HOST = "127.0.0.1"              # Loopback only; there is no LAN story yet
+DEFAULT_PORT = 8000                     # Also in frontend/src/constants.js
+
+# The shell generates a fresh random token per launch and passes it in
+# the environment rather than argv — argv is readable by any process on
+# the machine, and this token stops the motor.
+SHUTDOWN_TOKEN_ENV = "NWA_SHUTDOWN_TOKEN"
+SHUTDOWN_TOKEN_HEADER = "X-Shutdown-Token"
+
+# Absent token means "not launched by the shell" (dev, tests). The
+# endpoint then refuses everyone rather than defaulting to open: in dev
+# the operator has Ctrl+C, so an open shutdown route would be all risk
+# and no benefit.
+ERR_SHUTDOWN_DISABLED = "Shutdown endpoint is not enabled"
+ERR_SHUTDOWN_BAD_TOKEN = "Invalid shutdown token"
+
 # ── Serial link ───────────────────────────────────────────────────
 DEFAULT_BAUD = 115200                 # Must match the ESP32 firmware
 SERIAL_READ_TIMEOUT_S = 1.0

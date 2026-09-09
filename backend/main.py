@@ -8,7 +8,9 @@
 # auth.py for why (attribution, not secrecy).
 
 import asyncio
+import hmac                             # Constant-time compare for the shell's shutdown token
 import json
+import os
 import sys
 import threading                        # Serial reads are blocking; they run off the event loop
 import time
@@ -29,8 +31,9 @@ for _stream in (sys.stdout, sys.stderr):
 
 import serial
 import serial.tools.list_ports
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 import app_paths
 import audit
@@ -42,7 +45,9 @@ from constants import (
     ACK_ERROR, ACK_SENT, ACTION_TARE, ACTION_THROTTLE,
     AUDIT_CALIBRATION, AUDIT_THROTTLE, CAL_VALUE_FORMAT,
     CMD_CAL_DUMP, CMD_CAL_RESET, CMD_CAL_SET, CMD_TARE, CMD_THROTTLE,
-    DEFAULT_BAUD, DIR_CW, ERR_ALREADY_CONNECTED, ERR_PROFILE_RUNNING_CAL,
+    APP_VERSION, DEFAULT_BAUD, DIR_CW, ERR_ALREADY_CONNECTED,
+    ERR_PROFILE_RUNNING_CAL, ERR_SHUTDOWN_BAD_TOKEN, ERR_SHUTDOWN_DISABLED,
+    SHUTDOWN_TOKEN_ENV, SHUTDOWN_TOKEN_HEADER,
     ERR_SERIAL_CONNECT_FIRST, ERR_SERIAL_DOWN, ERR_SERIAL_WRITE,
     ESP32_PORT_KEYWORDS, EVENT_KEY, EV_CAL, EV_CAL_DEFAULTS, EV_CAL_SET,
     LOG_PROFILE, LOG_RECORDING, LOG_SERIAL, LOG_SERVER, LOG_WS,
@@ -1267,3 +1272,63 @@ def get_paths(operator: str = Depends(require_auth)):
         "login":    str(app_paths.login_file()),
         "recovery": str(app_paths.recovery_dir()),
     }
+
+
+# ================================================================
+# DESKTOP SHELL (TAURI SIDECAR) — /health, /shutdown
+# ================================================================
+# Both are deliberately outside the operator-session gate that covers
+# every other route, because the caller is the Rust shell, not a signed
+# in human — the shell has to poll readiness and ask for a clean stop
+# before any account exists or anyone has logged in. /health leaks
+# nothing an attacker on loopback couldn't get by connecting to the
+# port anyway, and /shutdown carries its own token instead.
+# tests/test_deployment.py pins that token behaviour, and the coverage
+# guard in tests/test_auth.py names these two as the only exemptions.
+
+# Set by run_backend.py to uvicorn's "stop serving" switch. Left None
+# under `uvicorn main:app` (dev) and in tests, where Ctrl+C is the way
+# out and nothing should be able to stop the server over HTTP.
+request_shutdown = None
+
+
+@app.get("/health")
+def health():
+    """Readiness probe the shell polls instead of sleeping a fixed time."""
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "serial_connected": serial_status["connected"],
+        # The shell refuses to install an update while either is true —
+        # an update kills the process that owns the safety cut.
+        "profile_running": profile_state["phase"] not in (
+            PHASE_IDLE, PHASE_DONE, PHASE_ABORTED, PHASE_ERROR),
+        "recording": recording,
+    }
+
+
+@app.post("/shutdown")
+async def shutdown_endpoint(request: Request):
+    """Stop gracefully so the shutdown handler can cut the throttle.
+
+    The handler this eventually reaches aborts a running profile *before*
+    tearing down the serial port, which is what lets _run_profile()'s
+    finally block write THR_MIN and flush it. A force-kill from the shell
+    would skip all of that and leave the ESC driving its last commanded
+    value, so the shell asks here first and only kills if this never
+    lands (DEPLOYMENT.md §9).
+    """
+    expected = os.environ.get(SHUTDOWN_TOKEN_ENV)
+    if not expected or request_shutdown is None:
+        return JSONResponse({"ok": False, "error": ERR_SHUTDOWN_DISABLED}, status_code=404)
+
+    supplied = request.headers.get(SHUTDOWN_TOKEN_HEADER, "")
+    # Constant-time: a token that stops a 100 kgf test stand should not
+    # be guessable a character at a time off response timing.
+    if not hmac.compare_digest(supplied, expected):
+        print(f"{LOG_SERVER} Rejected shutdown request with a bad token")
+        return JSONResponse({"ok": False, "error": ERR_SHUTDOWN_BAD_TOKEN}, status_code=403)
+
+    print(f"{LOG_SERVER} Shutdown requested by the desktop shell")
+    request_shutdown()          # Flips uvicorn's should_exit; the shutdown handler then runs
+    return {"ok": True, "stopping": True}

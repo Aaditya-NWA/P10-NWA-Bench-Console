@@ -80,6 +80,28 @@ esp32/managed_components/
 sdkconfig
 sdkconfig.old
 
+# ── Desktop build (Tauri + PyInstaller) ──────────────────────────
+# Rust build tree and the frozen backend. src-tauri/resources/backend is
+# a *staged copy* of backend/dist_sidecar produced by scripts/build.ps1 —
+# ~120 MB of build output that is regenerated every build, never edited.
+src-tauri/target/
+src-tauri/resources/backend/
+src-tauri/gen/
+backend/dist_sidecar/
+backend/build_sidecar/
+
+# ── Signing material — never commit ──────────────────────────────
+# The updater's Ed25519 private key and the code-signing certificate.
+# Losing the updater key permanently breaks updates for every installed
+# copy (DEPLOYMENT.md §6); leaking it lets someone else sign an update
+# that installs as us. Both live outside the repo by default
+# (~/.nwa-bench-signing/); these patterns are a second line of defence.
+*.key
+*.pfx
+*.p12
+*.cer
+!*.key.pub
+
 # ── Miscellaneous ───────────────────────────────────────────────
 CLAUDE.md
 DEPLOYMENT.md

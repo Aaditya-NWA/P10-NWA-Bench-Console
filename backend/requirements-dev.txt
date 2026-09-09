@@ -1,0 +1,10 @@
+# Development and build-time dependencies, kept separate from
+# requirements.txt so the frozen app doesn't carry a test runner.
+#
+# Neither was previously recorded anywhere, which meant `pytest` in a
+# fresh venv failed with "No module named pytest" despite the documented
+# command in CLAUDE.md.
+-r requirements.txt
+
+pytest==9.1.1            # Backend test suite (backend/tests)
+pyinstaller==6.22.2      # Freezes the backend into the desktop sidecar
