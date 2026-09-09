@@ -55,7 +55,7 @@
     "updater": {
       "active": true,
       "dialog": false,
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZBQjk3M0E4REVBRjVBRTgKUldUb1dxL2VxSE81K21WaGpwRkk4WlRlbjRrS0w0Z3VITi81TXM4cHAyWFVqcUtJaSs3OWxVWi8K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQzODc0QjFGQzU3NEU5REQKUldUZDZYVEZIMHVIMDJMeXU3dk9kaW9XbWVvQ0hFYzV5V1BvU2RJd01ZL1VrWFBmekF2S0RJUloK",
       "endpoints": [
         "https://github.com/Aaditya-NWA/P10-NWA-Bench-Console/releases/latest/download/latest.json"
       ]

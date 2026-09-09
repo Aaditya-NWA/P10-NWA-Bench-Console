@@ -1,3 +1,7 @@
+﻿# NOTE: this file is saved as UTF-8 **with BOM** on purpose.
+# Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, which turns
+# every em dash below into mojibake and breaks parsing outright.
+# Keep the BOM if you re-save this file.
 # Build the NWA Bench Console desktop app end to end.
 #
 #     powershell -ExecutionPolicy Bypass -File scripts\build.ps1
@@ -11,13 +15,15 @@
 #
 #   -SkipFrontend / -SkipBackend  re-use the existing artifacts when you
 #                                 are only iterating on the Rust shell.
-#   -Debug                        faster, unoptimised, no installer.
+#   -DebugBuild                   faster, unoptimised, no installer.
+#                                 (not -Debug: that name is reserved by
+#                                 [CmdletBinding()] as a common parameter)
 
 [CmdletBinding()]
 param(
     [switch]$SkipFrontend,
     [switch]$SkipBackend,
-    [switch]$Debug
+    [switch]$DebugBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -82,26 +88,39 @@ Write-Host "      staged $sizeMb MB" -ForegroundColor DarkGray
 Step 4 "Building the Tauri shell and installer"
 Push-Location $Root
 try {
-    # The signing key is read from the environment. Without it the build
-    # still succeeds but produces no .sig, and an unsigned artifact is
-    # one the updater will refuse to install — so say so loudly rather
-    # than discovering it after publishing a release (§6).
+    # Signing material. Both the key and its password must be present as
+    # real environment variables before `tauri build` runs, or the CLI
+    # stops on an interactive password prompt and the build hangs forever
+    # with no output — it looks like a slow LTO build, not a stall.
+    #
+    # The password cannot be empty for the same reason: in PowerShell
+    # `$env:X = ""` REMOVES the variable rather than setting it empty
+    # (unlike an exported empty var in bash), so a passwordless key is
+    # indistinguishable from no password at all and prompts. The key is
+    # therefore generated *with* a password.
+    $keyDir = Join-Path $env:USERPROFILE ".nwa-bench-signing"
     if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
-        $defaultKey = Join-Path $env:USERPROFILE ".nwa-bench-signing\nwa-bench.key"
-        if (Test-Path $defaultKey) {
-            # The *contents*, not the path. Tauri reads the path form
-            # inconsistently across versions and fails with "a public key
-            # has been found, but no private key" — which reads like a
-            # missing key rather than a wrong variable name.
-            $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $defaultKey -Raw)
-            $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
-            Write-Host "      signing with $defaultKey" -ForegroundColor DarkGray
+        $keyFile = Join-Path $keyDir "nwa-bench.key"
+        $pwFile  = Join-Path $keyDir "password.txt"
+        if (Test-Path $keyFile) {
+            # The key *contents*, not its path: the CLI reads the path
+            # variant inconsistently and reports "a public key has been
+            # found, but no private key", which reads like a missing key.
+            $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content $keyFile -Raw)
+            if (Test-Path $pwFile) {
+                $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content $pwFile -Raw).Trim()
+            }
+            Write-Host "      signing with $keyFile" -ForegroundColor DarkGray
         } else {
-            Write-Warning "No updater signing key found. The installer will build, but it will NOT be signed and installed copies will refuse it as an update."
+            Write-Warning "No updater signing key found at $keyFile. The installer will build, but it will NOT be signed and installed copies will refuse it as an update."
         }
     }
 
-    if ($Debug) { npx tauri build --debug } else { npx tauri build }
+    if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -and $env:TAURI_SIGNING_PRIVATE_KEY) {
+        throw "The signing key is set but its password is not. tauri build would stop on an interactive prompt and hang. Put the password in $keyDir\password.txt or set TAURI_SIGNING_PRIVATE_KEY_PASSWORD."
+    }
+
+    if ($DebugBuild) { npx tauri build --debug } else { npx tauri build }
     if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 } finally { Pop-Location }
 

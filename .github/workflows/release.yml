@@ -91,6 +91,17 @@ jobs:
       - name: Install root dependencies
         run: npm ci
 
+      # The Updates panel shows this as the update's title, so it is the
+      # one line an operator reads before deciding to install. Taken from
+      # the tagged commit's subject rather than written by hand, so it
+      # cannot drift from what actually shipped.
+      - name: Read the tagged commit's subject line
+        id: commit
+        shell: bash
+        run: |
+          subject="$(git log -1 --pretty=%s)"
+          echo "subject=$subject" >> "$GITHUB_OUTPUT"
+
       - name: Build, sign, and draft the release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -103,17 +114,9 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "NWA Bench Console ${{ github.ref_name }}"
-          releaseBody: |
-            Desktop build of the NWA Bench Console.
-
-            Installed copies check for updates on their own schedule and
-            will offer this version — but never while the ESP32 is
-            connected or a run is in progress.
-
-            First install: run the setup .exe. Windows SmartScreen will
-            warn unless the signing certificate has been trusted on this
-            machine (see DEPLOYMENT.md §7); "More info" then "Run anyway"
-            is safe here.
+          # Becomes latest.json's "notes", which is what the Updates
+          # panel renders as the update title.
+          releaseBody: ${{ steps.commit.outputs.subject }}
           # Draft on purpose — see the header.
           releaseDraft: true
           prerelease: false

@@ -97,6 +97,31 @@ export const CAL_STATUS = {
   ERROR:  "error",
 };
 
+// ── Settings modal tabs ───────────────────────────────────────────
+export const SETTINGS_TAB = {
+  CALIBRATION: "calibration",
+  UPDATES:     "updates",
+};
+
+// ── Updates ───────────────────────────────────────────────────────
+// Mirrors the `state` field of the shell's updates_check command. The
+// last three are deliberately distinct: "none" means the release
+// channel was read and we are current, while "unreachable" means it
+// could not be read at all — a private repository between releases, or
+// no network. Showing "No updates available" for both would make a
+// closed release window look like a working one.
+export const UPDATE_STATE = {
+  AVAILABLE:   "available",
+  NONE:        "none",
+  UNREACHABLE: "unreachable",
+  UNSUPPORTED: "unsupported",   // Running in a browser, not the desktop app
+};
+
+// Emitted by the Rust shell while an update downloads.
+export const EVT_UPDATE_PROGRESS = "update://progress";
+
+export const MSG_NO_UPDATES = "No Updates Available.";
+
 export const THEME = { DARK: "dark", LIGHT: "light" };
 export const THEME_ATTR = "data-theme";
 

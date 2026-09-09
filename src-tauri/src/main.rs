@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 // Must match backend/constants.py — DEFAULT_HOST / DEFAULT_PORT and the
@@ -47,12 +47,6 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// recording and closes the port; that is fast, but it does perform a
 /// serial write, so this is not tight.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-/// Update cadence (DEPLOYMENT.md §6). The first check is deliberately
-/// delayed — an update prompt in the first seconds of launch is exactly
-/// when the operator is trying to start work.
-const FIRST_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(120);
-const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// Last lines of the sidecar's own stdout/stderr, kept so a failed
 /// startup can show the operator something better than a blank window.
@@ -196,15 +190,6 @@ struct BenchState {
     recording: bool,
 }
 
-impl BenchState {
-    /// "Never prompt or install while the ESP32 is connected or a profile
-    /// is running." Recording is included on the same reasoning: an
-    /// update mid-recording ends the run.
-    fn busy(&self) -> bool {
-        self.serial_connected || self.profile_running || self.recording
-    }
-}
-
 fn read_bench_state() -> Option<BenchState> {
     let res = http().get(backend_url("/health")).send().ok()?;
     let body: serde_json::Value = res.json().ok()?;
@@ -274,108 +259,193 @@ fn stop_sidecar_gracefully(sidecar: &Sidecar) -> bool {
 }
 
 /// Background loop: check for updates, respecting the bench-busy gate.
-fn spawn_update_loop(app: AppHandle) {
-    // A plain thread rather than an async task: the only thing this loop
-    // does is sleep for days at a time, and block_on keeps the updater's
-    // async API usable without pulling tokio in as a direct dependency.
-    std::thread::spawn(move || {
-        std::thread::sleep(FIRST_UPDATE_CHECK_DELAY);
-        loop {
-            tauri::async_runtime::block_on(check_for_update(&app));
-            std::thread::sleep(UPDATE_CHECK_INTERVAL);
-        }
-    });
+// ================================================================
+// UPDATES — checked only when the operator asks
+// ================================================================
+// Deliberately manual. The earlier design polled GitHub every 3 days,
+// which requires the repository to be public *permanently*. Checking
+// only on an explicit click means the release channel has to be
+// reachable only in the moment the operator presses the button, so the
+// repo can sit private between releases and be opened for the window in
+// which operators are told to update.
+//
+// What has NOT changed is the safety rule (DEPLOYMENT.md §6): an update
+// replaces the process that owns the serial port and the throttle cut,
+// so it must never install mid-test. The manual button removes the
+// "don't interrupt them" half of that rule — the operator chose this
+// moment — but not the "don't kill a live run" half, which is enforced
+// in `updates_install` and re-checked immediately before installing.
+
+/// Progress events pushed to the dashboard while a download runs.
+const EVENT_UPDATE_PROGRESS: &str = "update://progress";
+
+#[derive(Clone, serde::Serialize)]
+struct UpdateProgress {
+    downloaded: u64,
+    total: Option<u64>,
 }
 
-async fn check_for_update(app: &AppHandle) {
-    // Gate #1 — before we even ask GitHub. Checking is harmless, but
-    // prompting is not, and there is no reason to do the work.
-    match read_bench_state() {
-        Some(state) if state.busy() => return,
-        Some(_) => {}
-        // Backend unreachable: it may be mid-restart. Skip this round
-        // rather than updating an app whose state we cannot read.
-        None => return,
-    }
+/// The result of a check, in the shape the Updates panel renders.
+///
+/// `state` separates three outcomes that are easy to conflate and need
+/// different words in front of the operator:
+///
+///   "available"   — a newer version exists
+///   "none"        — the manifest was read and we are current
+///   "unreachable" — the manifest could not be read at all
+///
+/// That last one is the private-repo case. GitHub answers 404 for a
+/// private repo *and* for one with no releases yet, so the two are
+/// indistinguishable from here — but both are very much distinguishable
+/// from "you are up to date", and reporting them as that would make a
+/// closed release window look like a working one.
+#[derive(Default, serde::Serialize)]
+struct UpdateInfo {
+    state: String,
+    current_version: String,
+    version: Option<String>,
+    title: Option<String>,
+    size_bytes: Option<u64>,
+    detail: Option<String>,
+}
 
-    let updater = match app.updater() {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("[Shell] Updater unavailable: {e}");
-            return;
+/// Ask the release channel what the newest published version is.
+#[tauri::command]
+async fn updates_check(app: AppHandle) -> Result<UpdateInfo, String> {
+    let current = app.package_info().version.to_string();
+    let updater = app.updater().map_err(|e| e.to_string())?;
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            // Size is best-effort. GitHub redirects release assets to a
+            // storage host that does report Content-Length, but a HEAD
+            // that fails is not worth failing the whole check over — the
+            // panel simply omits the size.
+            let url = update.download_url.to_string();
+            let size = tauri::async_runtime::spawn_blocking(move || content_length(&url))
+                .await
+                .ok()
+                .flatten();
+
+            Ok(UpdateInfo {
+                state: "available".into(),
+                current_version: current,
+                version: Some(update.version.clone()),
+                // The release body, which the release workflow seeds
+                // from the tagged commit's subject line.
+                title: update.body.clone().filter(|b| !b.trim().is_empty()),
+                size_bytes: size,
+                detail: None,
+            })
         }
-    };
+        Ok(None) => Ok(UpdateInfo {
+            state: "none".into(),
+            current_version: current,
+            ..Default::default()
+        }),
+        Err(e) => Ok(UpdateInfo {
+            state: "unreachable".into(),
+            current_version: current,
+            detail: Some(e.to_string()),
+            ..Default::default()
+        }),
+    }
+}
 
-    // No internet, GitHub down, malformed manifest — all land here and
-    // are deliberately silent to the operator (§6).
-    let update = match updater.check().await {
-        Ok(Some(update)) => update,
-        Ok(None) => return,
-        Err(e) => {
-            eprintln!("[Shell] Update check failed: {e}");
-            return;
-        }
-    };
+/// HEAD the asset to learn its size before committing to a download.
+fn content_length(url: &str) -> Option<u64> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?
+        .head(url)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())?
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
 
-    let notes = update.body.clone().unwrap_or_default();
-    let prompt = format!(
-        "Version {} is available.\n\n{}\n\nThe console will restart to finish installing.",
-        update.version,
-        if notes.trim().is_empty() { "No release notes." } else { notes.trim() }
-    );
-
-    let accepted = app
-        .dialog()
-        .message(prompt)
-        .title("Update available")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom(
-            "Install and restart".into(),
-            "Not now".into(),
-        ))
-        .blocking_show();
-
-    if !accepted {
-        return;
+/// Download and install, reporting progress as it goes.
+#[tauri::command]
+async fn updates_install(app: AppHandle) -> Result<(), String> {
+    // Gate #1. The operator asked for this, so the answer is a sentence
+    // they can act on — "disconnect and try again" — not silence.
+    if let Some(reason) = busy_reason() {
+        return Err(reason);
     }
 
-    // Gate #2 — re-checked immediately before installing, because the
-    // operator may have connected the rig or started a profile while the
-    // dialog was open. §6 calls this out specifically.
-    match read_bench_state() {
-        Some(state) if state.busy() => {
-            app.dialog()
-                .message(
-                    "The update was not installed: the test stand is connected or a run is in \
-                     progress.\n\nDisconnect the ESP32 and stop any running profile, then try \
-                     again.",
-                )
-                .title("Update postponed")
-                .kind(MessageDialogKind::Warning)
-                .blocking_show();
-            return;
-        }
-        Some(_) => {}
-        None => return,
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Could not reach the update channel: {e}"))?
+        .ok_or_else(|| "There is no update to install.".to_string())?;
+
+    let downloaded = std::sync::atomic::AtomicU64::new(0);
+    let bytes = update
+        .download(
+            |chunk, total| {
+                let so_far = downloaded
+                    .fetch_add(chunk as u64, std::sync::atomic::Ordering::Relaxed)
+                    + chunk as u64;
+                let _ = app.emit(
+                    EVENT_UPDATE_PROGRESS,
+                    UpdateProgress { downloaded: so_far, total },
+                );
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    // Gate #2 — re-checked after the download, because it takes time and
+    // the operator may have reconnected the rig or started a run while
+    // it ran. §6 calls this re-check out specifically.
+    if let Some(reason) = busy_reason() {
+        return Err(reason);
     }
 
-    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-        eprintln!("[Shell] Update install failed: {e}");
-        app.dialog()
-            .message(format!("The update could not be installed:\n{e}"))
-            .title("Update failed")
-            .kind(MessageDialogKind::Error)
-            .blocking_show();
-        return;
-    }
-
-    // Same handshake as closing the window — the installer is about to
-    // replace the process that owns the serial port (§9, "Shutdown via
-    // update"), so the backend must be stopped properly first.
+    // The installer is about to replace the process holding the serial
+    // port, so the backend stops through the same handshake a window
+    // close uses — never a kill (§9, "Shutdown via update").
     if let Some(sidecar) = app.try_state::<Sidecar>() {
         stop_sidecar_gracefully(&sidecar);
     }
-    app.restart();
+
+    update.install(bytes).map_err(|e| format!("Install failed: {e}"))?;
+    Ok(())
+}
+
+/// Why an update must not install right now, if it must not.
+///
+/// Returns None when it is safe. A backend we cannot reach is treated as
+/// unsafe: it may be mid-restart with a profile still running, and
+/// guessing "probably idle" is the wrong way to be wrong here.
+fn busy_reason() -> Option<String> {
+    match read_bench_state() {
+        Some(state) if state.profile_running => {
+            Some("A throttle profile is running. Stop it before installing an update.".into())
+        }
+        Some(state) if state.recording => {
+            Some("A recording is in progress. Stop it before installing an update.".into())
+        }
+        Some(state) if state.serial_connected => Some(
+            "The ESP32 is still connected. Disconnect it before installing an update — \
+             installing restarts the console, which drops the link to the stand."
+                .into(),
+        ),
+        Some(_) => None,
+        None => Some(
+            "Cannot read the backend's state, so it is not safe to install right now. \
+             Try again in a moment."
+                .into(),
+        ),
+    }
 }
 
 fn main() {
@@ -396,6 +466,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .manage(Sidecar::new(token))
+        .invoke_handler(tauri::generate_handler![updates_check, updates_install])
         .setup(|app| {
             let handle = app.handle().clone();
             let sidecar = app.state::<Sidecar>();
@@ -425,7 +496,6 @@ fn main() {
                 let deadline = Instant::now() + STARTUP_TIMEOUT;
                 if wait_for_health(deadline) {
                     let _ = watcher.emit("backend-ready", ());
-                    spawn_update_loop(watcher);
                     return;
                 }
 

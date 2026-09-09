@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { CAL_STATUS, NO_VALUE } from "../constants";
+import { CAL_STATUS, NO_VALUE, SETTINGS_TAB } from "../constants";
+import UpdatesPanel from "./UpdatesPanel";
 
 /**
  * SettingsModal — editor for the ESP32's runtime calibration table.
@@ -40,6 +41,10 @@ export default function SettingsModal({
   // them — a number-typed draft would snap "18178." back mid-keystroke.
   const [draft, setDraft] = useState({});
   const [confirmingReset, setConfirmingReset] = useState(false);
+
+  // Which tab is showing. Calibration is the default because it is what
+  // the panel is opened for between runs; updates are occasional.
+  const [tab, setTab] = useState(SETTINGS_TAB.CALIBRATION);
 
   // Merges rather than replaces: an unrelated background dump must not
   // wipe half-typed input for a key the operator is mid-edit on.
@@ -138,25 +143,47 @@ export default function SettingsModal({
 
         <header style={styles.header}>
           <div>
-            <h2 style={styles.title}>Calibration Settings</h2>
+            <h2 style={styles.title}>Settings</h2>
             <p style={styles.subtitle}>
-              Live values on the ESP32. Saved to the device's flash — they survive a
-              power cycle, and no reflash is needed.
+              {tab === SETTINGS_TAB.CALIBRATION
+                ? "Live values on the ESP32. Saved to the device's flash — they survive a power cycle, and no reflash is needed."
+                : "Check for and install a new version of the console."}
             </p>
           </div>
           <button style={styles.closeBtn} onClick={onClose} title="Close">✕</button>
         </header>
 
-        {!serialConnected && (
+        <nav style={styles.tabs}>
+          {[
+            [SETTINGS_TAB.CALIBRATION, "Calibration"],
+            [SETTINGS_TAB.UPDATES,     "Updates"],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              style={{
+                ...styles.tab,
+                ...(tab === key ? styles.tabActive : null),
+              }}
+              onClick={() => setTab(key)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        {tab === SETTINGS_TAB.CALIBRATION && !serialConnected && (
           <div style={{ ...styles.banner, ...styles.bannerWarn }}>
             Not connected to the ESP32 — values below may be stale, and edits can't be saved.
           </div>
         )}
-        {error && (
+        {tab === SETTINGS_TAB.CALIBRATION && error && (
           <div style={{ ...styles.banner, ...styles.bannerError }}>{error}</div>
         )}
 
         <div style={styles.body}>
+          {tab === SETTINGS_TAB.UPDATES && <UpdatesPanel />}
+
+          {tab === SETTINGS_TAB.CALIBRATION && (<>
           {groups.length === 0 && (
             <p style={styles.empty}>
               {busy ? "Reading calibration from the device…"
@@ -234,8 +261,12 @@ export default function SettingsModal({
               </div>
             </section>
           ))}
+          </>)}
         </div>
 
+        {/* Save / Reload / Reset act on the calibration table only, so
+            they are part of that tab rather than the modal chrome. */}
+        {tab === SETTINGS_TAB.CALIBRATION && (
         <footer style={styles.footer}>
           <span style={{
             ...styles.status,
@@ -281,6 +312,7 @@ export default function SettingsModal({
             </button>
           </div>
         </footer>
+        )}
       </div>
     </div>
   );
@@ -349,6 +381,31 @@ const styles = {
     padding:        "0.4rem 0.55rem",
     cursor:         "pointer",
     flexShrink:     0,
+  },
+  tabs: {
+    display:        "flex",
+    gap:            "0.3rem",
+    padding:        "0.7rem 1.4rem 0",
+    borderBottom:   "1px solid var(--bg-border)",
+    flexShrink:     0,
+  },
+  tab: {
+    background:     "transparent",
+    border:         "none",
+    borderBottom:   "2px solid transparent",
+    color:          "var(--text-secondary)",
+    fontFamily:     "var(--font-ui)",
+    fontSize:       "0.74rem",
+    fontWeight:     700,
+    letterSpacing:  "0.08em",
+    textTransform:  "uppercase",
+    padding:        "0.45rem 0.7rem",
+    cursor:         "pointer",
+    marginBottom:   "-1px",
+  },
+  tabActive: {
+    color:          "var(--text-primary)",
+    borderBottom:   "2px solid var(--accent, #3b82f6)",
   },
   banner: {
     margin:         "0.8rem 1.4rem 0",

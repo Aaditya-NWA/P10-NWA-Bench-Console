@@ -114,6 +114,64 @@ def test_updater_endpoint_and_pubkey_are_configured():
         "update manifests must be fetched over HTTPS"
 
 
+# ── Updates are on-demand only ────────────────────────────────────
+
+@needs_shell
+def test_the_shell_exposes_manual_update_commands():
+    """The Updates panel drives these two; without them the tab is inert."""
+    src = MAIN_RS.read_text(encoding="utf-8")
+    for command in ("async fn updates_check", "async fn updates_install"):
+        assert command in src, f"{command} missing from the shell"
+    assert "generate_handler![updates_check, updates_install]" in src,         "the update commands are not registered with the invoke handler"
+
+
+@needs_shell
+def test_the_shell_never_checks_for_updates_on_its_own():
+    """No timer, no launch check — the operator's click is the only trigger.
+
+    This is what lets the release repository stay private between
+    releases: the update endpoint has to be reachable at the moment of
+    the click rather than permanently. A reintroduced background poll
+    would quietly restore the always-public requirement, and nothing
+    else in the app would look different.
+    """
+    src = MAIN_RS.read_text(encoding="utf-8")
+    for banned in ("UPDATE_CHECK_INTERVAL", "FIRST_UPDATE_CHECK_DELAY",
+                   "spawn_update_loop"):
+        assert banned not in src, (
+            f"{banned} is back in the shell — updates must only be checked "
+            "when the operator asks (DEPLOYMENT.md §6)"
+        )
+
+
+@needs_shell
+def test_the_updater_plugin_does_not_own_the_dialog():
+    """The panel renders the prompt, so the plugin's own dialog stays off.
+
+    With both enabled the operator gets a native popup *and* the in-app
+    panel for the same update.
+    """
+    conf = json.loads(TAURI_CONF.read_text())
+    assert conf["plugins"]["updater"].get("dialog") is False
+
+
+@needs_shell
+def test_install_is_still_gated_on_a_live_bench():
+    """Manual triggering changed who starts an update, not when it is safe.
+
+    An update replaces the process that owns the serial port and the
+    throttle cut, so the pre-download and post-download checks both have
+    to be there (§6).
+    """
+    src = MAIN_RS.read_text(encoding="utf-8")
+    install = src.split("async fn updates_install")[1].split("\nfn ")[0]
+    assert install.count("busy_reason()") >= 2, (
+        "updates_install must check the bench state before downloading AND "
+        "again before installing — state can change while 40 MB downloads"
+    )
+    assert "stop_sidecar_gracefully" in install,         "the sidecar must stop through the handshake before the installer runs"
+
+
 @needs_shell
 def test_frozen_backend_is_not_committed():
     """The staged sidecar is ~120 MB of build output, regenerated on every build."""
