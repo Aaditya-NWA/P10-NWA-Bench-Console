@@ -122,7 +122,8 @@ def test_the_shell_exposes_manual_update_commands():
     src = MAIN_RS.read_text(encoding="utf-8")
     for command in ("async fn updates_check", "async fn updates_install"):
         assert command in src, f"{command} missing from the shell"
-    assert "generate_handler![updates_check, updates_install]" in src,         "the update commands are not registered with the invoke handler"
+    assert "generate_handler![updates_check, updates_install]" in src, \
+        "the update commands are not registered with the invoke handler"
 
 
 @needs_shell
@@ -168,7 +169,8 @@ def test_install_is_still_gated_on_a_live_bench():
         "updates_install must check the bench state before downloading AND "
         "again before installing — state can change while 40 MB downloads"
     )
-    assert "stop_sidecar_gracefully" in install,         "the sidecar must stop through the handshake before the installer runs"
+    assert "stop_sidecar_gracefully" in install, \
+        "the sidecar must stop through the handshake before the installer runs"
 
 
 @needs_shell
