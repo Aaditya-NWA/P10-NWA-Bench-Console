@@ -1,6 +1,6 @@
 {
   "name": "nwa-bench-console-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Desktop shell for NWA Bench Console — Tauri window + frozen FastAPI sidecar",
   "private": true,
   "scripts": {

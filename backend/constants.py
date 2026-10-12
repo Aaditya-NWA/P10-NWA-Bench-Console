@@ -11,7 +11,7 @@ from __future__ import annotations
 # tests/test_deployment.py fails the build if they drift apart, because
 # the updater compares versions and a stale one means installed copies
 # either miss a release or reinstall one they already have.
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # ── Desktop shell (Tauri sidecar) ─────────────────────────────────
 # The backend runs as a child process of the Rust shell, which needs a

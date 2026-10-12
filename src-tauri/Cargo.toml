@@ -1,6 +1,6 @@
 [package]
 name = "nwa-bench-console"
-version = "1.0.0"
+version = "1.0.1"
 description = "NWA Bench Console — 100 kgf flight thrust test stand"
 authors = ["Nautical Wings Aerospace"]
 edition = "2021"

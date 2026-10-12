@@ -1,6 +1,6 @@
 {
   "name": "nwa-bench-console",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "NWA Bench Console — Motor Torque & Thrust Test Stand dashboard for Nautical Wings Aerospace",
   "private": true,
   "scripts": {
