@@ -49,6 +49,7 @@ export const EP = {
   CALIBRATION_RESET:"/calibration/reset",
   ANALYSIS_RUN:     "/analysis/run",
   ANALYSIS_EXPORT:  "/analysis/export-excel",
+  FIRMWARE_SOURCE:  "/firmware/source",
 };
 
 export const METHOD_GET  = "GET";
@@ -136,7 +137,15 @@ export const CAL_STATUS = {
 export const SETTINGS_TAB = {
   CALIBRATION: "calibration",
   UPDATES:     "updates",
+  FIRMWARE:    "firmware",
 };
+
+// ── Firmware source download ──────────────────────────────────────
+// Mirrors FIRMWARE_REPO / FIRMWARE_BRANCH in backend/firmware_source.py,
+// for display only — the backend decides what is actually fetched.
+export const FIRMWARE_REPO     = "Aaditya-NWA/P10-NWA-Bench-Console";
+export const FIRMWARE_BRANCH   = "main";
+export const FIRMWARE_ZIP_NAME = "esp32.zip";
 
 // ── Updates ───────────────────────────────────────────────────────
 // Mirrors the `state` field of the shell's updates_check command. The

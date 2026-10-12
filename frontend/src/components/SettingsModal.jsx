@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { CAL_STATUS, NO_VALUE, SETTINGS_TAB } from "../constants";
+import FirmwarePanel from "./FirmwarePanel";
 import UpdatesPanel from "./UpdatesPanel";
 
 /**
@@ -147,6 +148,8 @@ export default function SettingsModal({
             <p style={styles.subtitle}>
               {tab === SETTINGS_TAB.CALIBRATION
                 ? "Live values on the ESP32. Saved to the device's flash — they survive a power cycle, and no reflash is needed."
+                : tab === SETTINGS_TAB.FIRMWARE
+                ? "Download the ESP32 firmware source from GitHub."
                 : "Check for and install a new version of the console."}
             </p>
           </div>
@@ -156,6 +159,7 @@ export default function SettingsModal({
         <nav style={styles.tabs}>
           {[
             [SETTINGS_TAB.CALIBRATION, "Calibration"],
+            [SETTINGS_TAB.FIRMWARE,    "Firmware"],
             [SETTINGS_TAB.UPDATES,     "Updates"],
           ].map(([key, label]) => (
             <button
@@ -181,6 +185,7 @@ export default function SettingsModal({
         )}
 
         <div style={styles.body}>
+          {tab === SETTINGS_TAB.FIRMWARE && <FirmwarePanel />}
           {tab === SETTINGS_TAB.UPDATES && <UpdatesPanel />}
 
           {tab === SETTINGS_TAB.CALIBRATION && (<>

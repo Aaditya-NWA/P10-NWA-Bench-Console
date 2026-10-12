@@ -33,10 +33,11 @@ import serial
 import serial.tools.list_ports
 from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 import app_paths
 import audit
+import firmware_source
 import link_health
 import recorder
 import replay
@@ -1270,6 +1271,28 @@ def get_paths(operator: str = Depends(require_auth)):
         "login":    str(app_paths.login_file()),
         "recovery": str(app_paths.recovery_dir()),
     }
+
+
+@app.get("/firmware/source")
+def download_firmware_source(operator: str = Depends(require_auth)):
+    """The esp32/ folder from the repository's main branch, as esp32.zip.
+
+    Sync on purpose: the GitHub fetch blocks, so FastAPI runs this in a
+    worker thread instead of stalling telemetry on the event loop.
+    """
+    try:
+        data = firmware_source.build_firmware_zip()
+    except firmware_source.FirmwareSourceError as e:
+        # 502: the backend is fine, the upstream it depends on is not.
+        return JSONResponse({"detail": str(e)}, status_code=502)
+    print(f"[FIRMWARE] {operator} downloaded {firmware_source.FIRMWARE_ZIP_NAME} "
+          f"({len(data)} bytes)")
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{firmware_source.FIRMWARE_ZIP_NAME}"'},
+    )
 
 
 # ================================================================

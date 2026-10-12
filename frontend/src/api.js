@@ -59,7 +59,12 @@ export async function api(path, { method = METHOD_GET, body, raw = false } = {})
   }
 
   if (raw) {
-    if (!res.ok) throw { status: res.status, message: `Request failed (${res.status})` };
+    if (!res.ok) {
+      // A failed file download still answers in JSON; its detail says why.
+      let detail = null;
+      try { detail = (await res.json())?.detail; } catch { /* not JSON */ }
+      throw { status: res.status, message: detail || `Request failed (${res.status})` };
+    }
     return res;
   }
 
