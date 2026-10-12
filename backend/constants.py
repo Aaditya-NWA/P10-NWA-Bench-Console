@@ -58,6 +58,7 @@ THR_MAX = 2000
 # ── Commands written to the ESP32 ─────────────────────────────────
 CMD_TARE = "T"                        # Re-zero all cells and the current sensor
 CMD_THROTTLE = "S"                    # S<us>
+CMD_PING = "P"                        # P<n>; answered with a PONG carrying n — see link_health.py
 CMD_CAL_PREFIX = "C"                  # Every calibration command starts with this
 CMD_CAL_DUMP = CMD_CAL_PREFIX         # Bare "C" asks for the runtime table
 CMD_CAL_RESET = "C!"                  # Restore every value to its firmware default
@@ -71,8 +72,11 @@ CAL_VALUE_FORMAT = "{:.9g}"
 
 # ── Event names the firmware sends back ───────────────────────────
 EVENT_KEY = "event"
+EV_TARE_STARTED = "TARE_STARTED"     # Sent at once on "T"; TARE_DONE follows ~2 s later
 EV_TARE_DONE = "TARE_DONE"
 EV_THROTTLE_SET = "THROTTLE_SET"
+EV_PONG = "PONG"                      # Reply to a ping, with the device's link counters
+EV_BOOT = "BOOT"                      # First line after any reset, with the reset reason
 EV_CAL = "CAL"
 EV_CAL_DEFAULTS = "CAL_DEFAULTS"
 EV_CAL_SET = "CAL_SET"

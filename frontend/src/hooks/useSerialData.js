@@ -5,11 +5,17 @@ import {
   MSG, ACTION, FW_EVENT, TARE_STATUS, CAL_STATUS,
   MSG_BACKEND_UNREACHABLE,
 } from "../constants";
+import { summarizeTare } from "../tare";
 
 const RECONNECT_DELAY_MS   = 2000;  // Before retrying the browser↔backend WebSocket
 const STATUS_POLL_MS       = 2000;
 const PROFILE_POLL_MS      = 250;   // Only while a profile is running
 const TARE_STATUS_CLEAR_MS = 3000;
+const TARE_RESULT_SHOW_MS  = 8000;  // A partial or noisy tare stays up long enough to read
+// Only a safety net for a TARE_DONE that never comes. Current firmware
+// answers in ~2 s; the old blocking tare took ~13 s, so this has to
+// outlast that rather than re-enabling the button mid-tare.
+const TARE_FALLBACK_MS     = 20000;
 const CAL_SAVED_CLEAR_MS   = 2500;
 const RECORDING_NOTICE_MS  = 12000;
 const HISTORY_SIZE         = 600;   // 30 s @ ~20 Hz — must match backend HISTORY_SIZE
@@ -31,6 +37,9 @@ export function useSerialData({ enabled = true } = {}) {
   const [history, setHistory]       = useState([]);
   const [connected, setConnected]   = useState(false);       // Browser ↔ backend
   const [tareStatus, setTareStatus] = useState(null);
+  // Summary of the last TARE_DONE: duration, cells that kept their old
+  // zero, cells that were noisy. See tare.js.
+  const [tareResult, setTareResult] = useState(null);
   // Updated the instant a THROTTLE_SET event arrives rather than on the
   // next telemetry frame, which cost an extra full cycle of lag.
   const [confirmedThrottleUs, setConfirmedThrottleUs] = useState(null);
@@ -62,6 +71,25 @@ export function useSerialData({ enabled = true } = {}) {
 
   const wsRef        = useRef(null);
   const reconnectRef = useRef(null);
+
+  // One timer for the Tare button's state, replaced on every change.
+  // It used to be a fresh setTimeout per message, so the 3 s clear
+  // scheduled by the "sent" ack fired in the MIDDLE of the firmware's
+  // tare and re-enabled the button while the cells were still being
+  // zeroed. Refs and setters only, so connect() can stay stable.
+  const tareTimerRef  = useRef(null);
+  const tareStatusRef = useRef(null);
+  const showTare = (status, clearAfterMs) => {
+    clearTimeout(tareTimerRef.current);
+    tareStatusRef.current = status;
+    setTareStatus(status);
+    if (clearAfterMs) {
+      tareTimerRef.current = setTimeout(() => {
+        tareStatusRef.current = null;
+        setTareStatus(null);
+      }, clearAfterMs);
+    }
+  };
 
   // BUG FIX: `recording` used to be a dependency of connect(), so the
   // mount effect's cleanup tore down the WebSocket on every start/stop
@@ -103,8 +131,13 @@ export function useSerialData({ enabled = true } = {}) {
         // each one overwrote tareStatus and the Tare button flickered
         // through "Command Sent" during an unrelated drag.
         if (msg.type === MSG.ACK && msg.action === ACTION.TARE) {
-          setTareStatus(msg.status);
-          setTimeout(() => setTareStatus(null), TARE_STATUS_CLEAR_MS);
+          if (msg.status === TARE_STATUS.ERROR) {
+            showTare(TARE_STATUS.ERROR, TARE_STATUS_CLEAR_MS);
+          } else if (tareStatusRef.current !== TARE_STATUS.TARING &&
+                     tareStatusRef.current !== TARE_STATUS.DONE) {
+            // Held until the firmware answers, not cleared on a timer
+            showTare(msg.status, TARE_FALLBACK_MS);
+          }
           return;
         }
         // Throttle acks need no state — the confirmed readout comes from
@@ -113,9 +146,15 @@ export function useSerialData({ enabled = true } = {}) {
           return;
         }
 
+        if (msg.event === FW_EVENT.TARE_STARTED) {
+          showTare(TARE_STATUS.TARING, TARE_FALLBACK_MS);
+          return;
+        }
         if (msg.event === FW_EVENT.TARE_DONE) {
-          setTareStatus(TARE_STATUS.DONE);
-          setTimeout(() => setTareStatus(null), TARE_STATUS_CLEAR_MS);
+          const result = summarizeTare(msg);
+          setTareResult(result);
+          const clean = result.ok && result.noisy.length === 0;
+          showTare(TARE_STATUS.DONE, clean ? TARE_STATUS_CLEAR_MS : TARE_RESULT_SHOW_MS);
           return;
         }
 
@@ -168,6 +207,14 @@ export function useSerialData({ enabled = true } = {}) {
           return;
         }
 
+        // Any other firmware event (BOOT, or one a newer build adds)
+        // must not fall through to the telemetry handling below — it
+        // would become `latest` and a blank point in the chart. The
+        // link panel reads BOOT from /status instead.
+        if (msg.event) {
+          return;
+        }
+
         setLatest(msg);
         // Kept in sync from telemetry too, in case a THROTTLE_SET was missed
         if (typeof msg.throttle_us === "number") {
@@ -206,6 +253,7 @@ export function useSerialData({ enabled = true } = {}) {
     connect();
     return () => {
       clearTimeout(reconnectRef.current);
+      clearTimeout(tareTimerRef.current);
       wsRef.current?.close();
     };
   }, [connect, enabled]);
@@ -217,7 +265,9 @@ export function useSerialData({ enabled = true } = {}) {
         setSerialConnected(data.serial?.connected ?? false);
         setSerialPort(data.serial?.port ?? "");
         setSerialError(data.serial?.error ?? "");
-        setHealth(data.health ?? null);
+        // Stamped on arrival, so values that keep counting between polls
+        // (ESP32 uptime) can be advanced locally instead of jumping every 2 s.
+        setHealth(data.health ? { ...data.health, received_at: Date.now() } : null);
         setRecorderInfo(data.recorder ?? null);
         if (data.profile) setProfile(data.profile);  // In case a WS push was missed
       } catch {
@@ -250,7 +300,8 @@ export function useSerialData({ enabled = true } = {}) {
   const sendTare = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: ACTION.TARE }));
-      setTareStatus(TARE_STATUS.SENDING);
+      setTareResult(null);
+      showTare(TARE_STATUS.SENDING, TARE_FALLBACK_MS);
     }
   }, []);
 
@@ -437,7 +488,7 @@ export function useSerialData({ enabled = true } = {}) {
   }, []);
 
   return {
-    latest, history, connected, tareStatus, sendTare, sendThrottle,
+    latest, history, connected, tareStatus, tareResult, sendTare, sendThrottle,
     confirmedThrottleUs,
     ports, refreshPorts, serialConnected, serialPort, serialError,
     connectSerial, disconnectSerial,

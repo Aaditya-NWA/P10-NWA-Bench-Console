@@ -24,10 +24,11 @@ import time
 from pathlib import Path
 
 from constants import (
-    CMD_CAL_DUMP, CMD_CAL_PREFIX, CMD_CAL_RESET, CMD_TARE, CMD_THROTTLE,
+    CMD_CAL_DUMP, CMD_CAL_PREFIX, CMD_CAL_RESET, CMD_PING, CMD_TARE, CMD_THROTTLE,
     CSV_ENCODING,
     DIR_CCW, DIR_CW, EV_CAL, EV_CAL_DEFAULTS, EV_CAL_RESET, EV_CAL_SET,
-    EV_TARE_DONE, EV_THROTTLE_SET, FILE_ENCODING, THR_MAX, THR_MIN,
+    EV_PONG, EV_TARE_DONE, EV_TARE_STARTED, EV_THROTTLE_SET, FILE_ENCODING,
+    THR_MAX, THR_MIN,
 )
 
 ENABLE_ENV = "NWA_BENCH_ALLOW_REPLAY"
@@ -54,6 +55,9 @@ SIM_PACK_VOLTAGE_V = 24.6
 SIM_PACK_RESISTANCE_OHM = 0.035
 SIM_SETTLED_RPM_ABS = 60.0           # Whichever of these is larger counts as settled
 SIM_SETTLED_RPM_FRAC = 0.01
+SIM_TARE_S = 2.0                     # Matches the firmware: 20 samples per cell at 10 SPS
+SIM_TARE_SAMPLES = 20
+SIM_TARE_CELLS = ("s1", "s2", "s3", "s4", "thrust")
 
 
 def replay_enabled() -> bool:
@@ -207,6 +211,12 @@ class ReplaySerial:
         # already two copies of it and a third would be worse.
         self._cal_defaults = dict(calibration or {})
         self._cal_values = dict(self._cal_defaults)
+        # Numbered like the firmware's frames, and re-numbered for a
+        # replayed file too: a captured log's own seq values would read
+        # as a reboot every time the file loops.
+        self._seq = 0
+        self._started = time.monotonic()
+        self._tare_done_at: float | None = None
 
     def readline(self) -> bytes:
         # Answer commands first: the firmware emits its event line
@@ -215,6 +225,9 @@ class ReplaySerial:
         with self._lock:
             if self._pending:
                 return self._pending.pop(0)
+            if self._tare_done_at is not None and time.monotonic() >= self._tare_done_at:
+                self._tare_done_at = None
+                return self._tare_done_line()
 
         now = time.monotonic()
         if now < self._next_at:
@@ -240,7 +253,16 @@ class ReplaySerial:
             self._index += 1
             frame.pop("ts", None)                        # Re-stamped by the reader, as with a live frame
 
+        frame["seq"] = self._seq
+        self._seq = (self._seq + 1) % (2 ** 32)
         return (json.dumps(frame) + "\n").encode()
+
+    def _tare_done_line(self) -> bytes:
+        cells = {k: {"n": SIM_TARE_SAMPLES, "sd_kg": round(random.uniform(0.0002, 0.0006), 5)}
+                 for k in SIM_TARE_CELLS}
+        return (json.dumps({"event": EV_TARE_DONE, "ok": True, "ms": int(SIM_TARE_S * 1000),
+                            "samples": SIM_TARE_SAMPLES, "cells": cells, "failed": []})
+                + "\n").encode()
 
     def write(self, data: bytes) -> int:
         text = data.decode(FILE_ENCODING, errors="ignore").strip()
@@ -248,9 +270,21 @@ class ReplaySerial:
             return 0
         with self._lock:
             if text == CMD_TARE:
-                self._pending.append(
-                    json.dumps({"event": EV_TARE_DONE}).encode() + b"\n"
-                )
+                # Two lines, like the firmware: STARTED now, DONE once
+                # the (simulated) samples are in.
+                self._pending.append(json.dumps(
+                    {"event": EV_TARE_STARTED, "samples": SIM_TARE_SAMPLES}).encode() + b"\n")
+                self._tare_done_at = time.monotonic() + SIM_TARE_S
+            elif text.startswith(CMD_PING):
+                try:
+                    n = int(text[1:])
+                except ValueError:
+                    return len(data)
+                self._pending.append(json.dumps({
+                    "event": EV_PONG, "n": n,
+                    "up_ms": int((time.monotonic() - self._started) * 1000),
+                    "rx_ovf": 0, "rx_err": 0, "bad_cmd": 0, "late": 0,
+                }).encode() + b"\n")
             elif text.startswith(CMD_THROTTLE):
                 try:
                     us = int(text[1:])

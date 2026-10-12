@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { TARE_STATUS, THEME, UNIT_SI } from "../constants";
+import LinkHealth from "./LinkHealth";
 
 /**
  * StatusBar — top header: logo, serial port picker, link health,
@@ -11,10 +12,13 @@ import { TARE_STATUS, THEME, UNIT_SI } from "../constants";
  *   stable          — stability flag from the latest frame, or undefined
  *                     when the firmware build doesn't emit it (a neutral
  *                     "N/A" badge, not a "SETTLING" that never clears)
- *   health          — frame_rate_hz, stalled, last_frame_age_s, malformed_total
+ *   health          — the backend's link health block, rendered by LinkHealth
+ *   latest / history — live telemetry; LinkHealth judges packet age and
+ *                     rate from these, since /status is only polled every 2 s
  *   commandsMayBeIgnored — the ESP32 build looks like it ignores
  *                     tare/throttle commands (RPM test pass)
- *   tareStatus      — null | sending | sent | done | error
+ *   tareStatus      — null | sending | sent | taring | done | error
+ *   tareResult      — summary of the last TARE_DONE (tare.js), or null
  *   onTare
  *   ports           — [{device, description}] from /ports
  *   refreshPorts
@@ -33,8 +37,11 @@ export default function StatusBar({
   wsConnected,
   stable,
   health,
+  latest,
+  history,
   commandsMayBeIgnored,
   tareStatus,
+  tareResult,
   onTare,
   ports,
   refreshPorts,
@@ -65,17 +72,52 @@ export default function StatusBar({
     refreshPorts();
   }, [refreshPorts]);
 
+  // A tare that finished isn't automatically a good one: a cell can
+  // keep its old zero (no samples) or have been disturbed while it was
+  // sampled. Both are said on the button rather than buried in a log.
+  const tarePartial = tareStatus === TARE_STATUS.DONE && tareResult && !tareResult.ok;
+  const tareNoisy   = tareStatus === TARE_STATUS.DONE && tareResult?.ok && tareResult.noisy.length > 0;
+  const tareSecs    = tareResult?.ms != null ? ` ${(tareResult.ms / 1000).toFixed(1)} s` : "";
+
   const tareLabel =
     tareStatus === TARE_STATUS.SENDING ? "Sending…"     :
     tareStatus === TARE_STATUS.SENT    ? "Command Sent" :
-    tareStatus === TARE_STATUS.DONE    ? "Tare Done ✓"  :
+    tareStatus === TARE_STATUS.TARING  ? "Taring… hold still" :
+    tarePartial                        ? `Tare partial — ${tareResult.failed.join(", ")} unchanged` :
+    tareNoisy                          ? `Tare done — ${tareResult.noisy.join(", ")} noisy` :
+    tareStatus === TARE_STATUS.DONE    ? `Tare Done ✓${tareSecs}` :
     tareStatus === TARE_STATUS.ERROR   ? "Serial Error" :
     "TARE ALL CELLS";
 
   const tareColour =
-    tareStatus === TARE_STATUS.DONE  ? "var(--status-stable)"   :
-    tareStatus === TARE_STATUS.ERROR ? "var(--status-offline)"  :
+    tarePartial                        ? "var(--status-offline)"  :
+    tareNoisy                          ? "var(--status-settling)" :
+    tareStatus === TARE_STATUS.DONE    ? "var(--status-stable)"   :
+    tareStatus === TARE_STATUS.ERROR   ? "var(--status-offline)"  :
     "var(--accent-thrust)";
+
+  // Locked only while a tare is in flight. A finished one (even a
+  // partial or noisy one, which stays on screen for a few seconds) can be
+  // retried straight away — that is usually exactly what's needed.
+  const tareInFlight = tareStatus === TARE_STATUS.SENDING || tareStatus === TARE_STATUS.SENT ||
+                       tareStatus === TARE_STATUS.TARING;
+  const tareLocked = !wsConnected || tareInFlight;
+
+  const tareTitle =
+    commandsMayBeIgnored
+      ? "The connected firmware build doesn't appear to process tare/throttle commands (RPM test pass) — this may have no effect on the device."
+    : tarePartial
+      ? `These kept their previous zero because they returned too few samples: ${tareResult.failed.join(", ")}. Check their wiring, then tare again.`
+    : tareNoisy
+      ? `The zero for ${tareResult.noisy.join(", ")} is less certain than the display resolution — something was touching or shaking the rig. Tare again with it still.
+
+${tareResult.detail}`
+    : tareResult?.detail
+      ? `Re-zero all four beam cells, the thrust cell and the current sensor (~2 s).
+
+Last tare:
+${tareResult.detail}`
+    : "Re-zero all four beam cells, the thrust cell and the current sensor";
 
   const handlePortChange = (e) => {
     const port = e.target.value;
@@ -115,10 +157,6 @@ export default function StatusBar({
       // the icon correctly stays as it was.
     }
   };
-
-  // Rate is worth showing only once frames are actually arriving —
-  // "0.0 Hz" beside a disconnected port is noise, not information.
-  const showRate = serialConnected && !!health && health.frame_rate_hz > 0;
 
   return (
     <header style={styles.bar}>
@@ -171,22 +209,16 @@ export default function StatusBar({
         )}
 
         {/* The difference between "the port is open" and "data is
-            actually arriving at the expected pace" */}
-        {showRate && (
-          <span
-            style={{
-              ...styles.rate,
-              color: health.stalled ? "var(--status-offline)"
-                   : health.frame_rate_hz < 10 ? "var(--status-settling)"
-                   : "var(--text-tertiary)",
-            }}
-            title={`${health.frames_total} frames since connect` +
-                   (health.malformed_total ? ` · ${health.malformed_total} malformed lines` : "") +
-                   ` · newest ${health.last_frame_age_s ?? "?"}s old`}
-          >
-            {health.frame_rate_hz.toFixed(1)} Hz
-          </span>
-        )}
+            actually arriving, intact, and commands are getting back".
+            A chip here; click it for the waveform and diagnostics. */}
+        <LinkHealth
+          health={health}
+          serialConnected={serialConnected}
+          serialPort={serialPort}
+          wsConnected={wsConnected}
+          latest={latest}
+          history={history}
+        />
 
         {/* Neutral "N/A" when the firmware build doesn't emit "stable"
             at all, rather than a "SETTLING" that never clears */}
@@ -228,14 +260,12 @@ export default function StatusBar({
             ...styles.tare,
             borderColor: tareColour,
             color:       tareColour,
-            opacity:     !wsConnected || !!tareStatus ? 0.6 : 1,
-            cursor:      !wsConnected || !!tareStatus ? "not-allowed" : "pointer",
+            opacity:     tareLocked ? 0.6 : 1,
+            cursor:      tareLocked ? "not-allowed" : "pointer",
           }}
           onClick={onTare}
-          disabled={!wsConnected || !!tareStatus}
-          title={commandsMayBeIgnored
-            ? "The connected firmware build doesn't appear to process tare/throttle commands (RPM test pass) — this may have no effect on the device."
-            : "Re-zero all four beam cells, the thrust cell and the current sensor"}
+          disabled={tareLocked}
+          title={tareTitle}
         >
           {tareLabel}
         </button>
@@ -450,13 +480,6 @@ const styles = {
     height:         "32px",
     cursor:         "pointer",
     fontSize:       "0.9rem",
-  },
-  rate: {
-    fontFamily:     "var(--font-mono)",
-    fontSize:       "0.74rem",
-    fontWeight:     600,
-    whiteSpace:     "nowrap",
-    cursor:         "help",
   },
   badge: {
     display:        "flex",

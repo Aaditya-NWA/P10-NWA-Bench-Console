@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse
 
 import app_paths
 import audit
+import link_health
 import recorder
 import replay
 from analysis import router as analysis_router
@@ -85,7 +86,6 @@ DEFAULT_RAMP_RATE     = 100.0
 
 AUTO_RECONNECT_INTERVAL_S = 2.0
 AUDIT_FLUSH_INTERVAL_S    = 0.5
-STALL_THRESHOLD_S         = 2.0         # ~40 missed frames at 20 Hz — past a hiccup
 BROADCAST_TIMEOUT_S       = 2.0
 CAL_DUMP_TIMEOUT_S        = 2.5
 CAL_DUMP_POLL_S           = 0.02
@@ -121,52 +121,14 @@ stop_reader_flag = threading.Event()    # Tells the reader thread to exit cleanl
 
 # "connected" only means the OS handle is open. A board that has hung,
 # browned out, or is wired to a dead TX line looks exactly as connected
-# as a healthy one — readline() just keeps timing out. Frame age answers
-# "is data still arriving", the rolling rate answers "at the pace the
-# firmware promises", and the malformed counter tells a quiet link from
-# a noisy one.
-HEALTH_RATE_WINDOW_S = 5.0
-serial_health: dict = {
-    "frames_total":    0,
-    "events_total":    0,                # TARE_DONE, CAL, ...
-    "malformed_total": 0,                # Lines that started with { but didn't parse
-    "last_frame_at":   None,             # Unix time
-    "connected_at":    None,             # Unix time
-    "frame_rate_hz":   0.0,
-}
-_frame_times: deque = deque(maxlen=400)  # Monotonic timestamps backing frame_rate_hz
-
-
-def _reset_serial_health() -> None:
-    serial_health.update(frames_total=0, events_total=0, malformed_total=0,
-                         last_frame_at=None, connected_at=time.time(),
-                         frame_rate_hz=0.0)
-    _frame_times.clear()
-
-
-def _note_frame() -> None:
-    """Record one telemetry frame for the health counters."""
-    now = time.monotonic()
-    _frame_times.append(now)
-    while _frame_times and now - _frame_times[0] > HEALTH_RATE_WINDOW_S:
-        _frame_times.popleft()
-    span = now - _frame_times[0] if len(_frame_times) > 1 else 0.0
-    serial_health["frames_total"] += 1
-    serial_health["last_frame_at"] = time.time()
-    serial_health["frame_rate_hz"] = round((len(_frame_times) - 1) / span, 1) if span > 0 else 0.0
+# as a healthy one. link_health.LinkMonitor tracks both directions of
+# the link — see that module for what each signal catches.
+link = link_health.LinkMonitor()
 
 
 def health_snapshot() -> dict:
-    """Serial health for /status, with the derived staleness verdict."""
-    last = serial_health["last_frame_at"]
-    age = (time.time() - last) if last else None
-    connected = bool(serial_conn and serial_conn.is_open)
-    stalled = bool(connected and (age is None or age > STALL_THRESHOLD_S))
-    return {
-        **serial_health,
-        "last_frame_age_s": round(age, 2) if age is not None else None,
-        "stalled": stalled,
-    }
+    """Link health for /status: counters, verdict, waveform and messages."""
+    return link.snapshot(connected=bool(serial_conn and serial_conn.is_open))
 
 # True only when the operator explicitly clicked Disconnect. The
 # auto-reconnect loop checks it so it doesn't reopen a port they
@@ -284,6 +246,26 @@ def list_available_ports() -> list[dict]:
         for p in serial.tools.list_ports.comports()
     ]
 
+def describe_port(port: str) -> dict:
+    """What the OS knows about the adapter — shown in the link panel.
+
+    Answers "which cable/adapter is this?" when there are several on the
+    bench, and a VID:PID survives a COM number change after a replug.
+    """
+    try:
+        for p in serial.tools.list_ports.comports():
+            if p.device == port:
+                return {
+                    "description":  p.description or "",
+                    "manufacturer": p.manufacturer or "",
+                    "vid_pid":      f"{p.vid:04X}:{p.pid:04X}" if p.vid is not None and p.pid is not None else "",
+                    "serial_number": p.serial_number or "",
+                }
+    except Exception:
+        pass                                                  # Purely informational
+    return {}
+
+
 def find_esp32_port() -> str | None:
     """The first visible port that looks like an ESP32, or None."""
     for p in serial.tools.list_ports.comports():
@@ -351,7 +333,8 @@ def serial_reader_thread(loop: asyncio.AbstractEventLoop, port: str, baud: int,
         serial_conn = (conn if conn is not None
                        else serial.Serial(port, baud, timeout=SERIAL_READ_TIMEOUT_S))
         serial_status.update(connected=True, port=port, error="")
-        _reset_serial_health()                               # Counters are per-connection, not per-process
+        # Counters are per-connection, not per-process
+        link.reset(port, baud, describe_port(port) if conn is None else {"description": "Replay / simulated source"})
         audit.log_serial("connected", port=port, baud=baud)
         print(f"{LOG_SERIAL} Connected on {port} @ {baud} baud")
 
@@ -372,6 +355,19 @@ def serial_reader_thread(loop: asyncio.AbstractEventLoop, port: str, baud: int,
                 except (serial.SerialException, OSError) as e:
                     print(f"{LOG_SERIAL} Initial calibration request failed: {e}")
 
+            # The PC → ESP32 direction has no traffic of its own between
+            # commands, so a dead command wire would only show up when
+            # the operator reaches for CUT. A ping a second makes it
+            # visible before then. Written from here because this loop
+            # already wakes at least once a second (the read timeout).
+            ping = link.next_ping()
+            if ping:
+                try:
+                    serial_conn.write(f"{ping}\n".encode())
+                except (serial.SerialException, OSError):
+                    pass                                      # Surfaces as missing PONGs, and readline() raises next
+            link.tick(connected=True)
+
             raw = serial_conn.readline()                     # Blocks until newline or the read timeout
             if not raw:
                 continue
@@ -387,7 +383,7 @@ def serial_reader_thread(loop: asyncio.AbstractEventLoop, port: str, baud: int,
                 # count is the signature of a baud mismatch or a noisy
                 # cable, which otherwise presents only as "the numbers
                 # look jumpy".
-                serial_health["malformed_total"] += 1
+                link.note_malformed()
                 continue
 
             # The firmware emits two shapes of JSON on the same wire:
@@ -399,18 +395,20 @@ def serial_reader_thread(loop: asyncio.AbstractEventLoop, port: str, baud: int,
             # events immediately — the frontend listens for them — but
             # keep them out of the telemetry stores below.
             if EVENT_KEY in frame:
-                serial_health["events_total"] += 1
                 # Calibration dumps are events too. The device sends
                 # values and defaults as two separate lines, so this
                 # merges rather than replaces.
                 _cache_calibration_event(frame)
-                asyncio.run_coroutine_threadsafe(broadcast(frame), loop)
+                # False for PONGs: once-a-second link bookkeeping that
+                # no browser needs to receive.
+                if link.note_event(frame):
+                    asyncio.run_coroutine_threadsafe(broadcast(frame), loop)
                 continue
 
             frame["ts"] = time.time()
             latest_data = frame
             history.append(frame)
-            _note_frame()
+            link.note_frame(frame)
 
             if recording:
                 session_recorder.write(frame)                # Straight to disk, so a crash can't lose the run
@@ -434,7 +432,7 @@ def serial_reader_thread(loop: asyncio.AbstractEventLoop, port: str, baud: int,
         # chasing, the first isn't.
         audit.log_serial("closed", port=port,
                          requested=bool(stop_reader_flag.is_set()),
-                         frames=serial_health["frames_total"])
+                         frames=link.frames_total, dropped=link.dropped_total)
         print(f"{LOG_SERIAL} Reader thread stopped")
 
 def start_serial(port: str, baud: int = DEFAULT_BAUD, conn=None) -> bool:

@@ -71,22 +71,57 @@ export const ACTION = {
 
 // ── Firmware event names, forwarded verbatim by the backend ───────
 export const FW_EVENT = {
+  TARE_STARTED: "TARE_STARTED",
   TARE_DONE:    "TARE_DONE",
   THROTTLE_SET: "THROTTLE_SET",
   CAL:          "CAL",
   CAL_DEFAULTS: "CAL_DEFAULTS",
   CAL_SET:      "CAL_SET",
   CAL_RESET:    "CAL_RESET",
+  BOOT:         "BOOT",
 };
 
 // ── UI state enums ────────────────────────────────────────────────
 // SENDING is set locally the moment the command leaves the browser;
-// SENT / ERROR come from the backend's ack, DONE from the firmware.
+// SENT / ERROR come from the backend's ack, TARING and DONE from the
+// firmware (TARING only from builds that send TARE_STARTED).
 export const TARE_STATUS = {
   SENDING: "sending",
   SENT:    "sent",
+  TARING:  "taring",
   DONE:    "done",
   ERROR:   "error",
+};
+
+// A tare's zero is uncertain by sd/sqrt(n). Past the display dead band
+// (the firmware's own figure for each cell type) that uncertainty would
+// show up on screen as a non-zero idle reading, so the cell is flagged.
+export const TARE_ZERO_LIMIT_KG = { beam: 0.005, thrust: 0.05 };
+
+// ── Serial link health (backend link_health.py) ───────────────────
+export const LINK_VERDICT = {
+  OK:      "ok",
+  WARN:    "warn",
+  ERROR:   "error",
+  OFFLINE: "offline",
+};
+
+// ESP32 communication card — judged from the age of the newest valid
+// packet, not from whether the COM port happens to be open.
+export const COMM_STATUS = {
+  CONNECTED:    "connected",
+  WARNING:      "warning",
+  DISCONNECTED: "disconnected",
+};
+export const COMM_WARN_MS = 250;    // Five missed frames at 20 Hz
+export const COMM_LOST_MS = 1000;   // Twenty missed frames — the link is down
+
+export const CMD_LINK = {
+  OK:         "ok",
+  LOST:       "lost",
+  WAITING:    "waiting",
+  UNVERIFIED: "unverified",
+  OFFLINE:    "offline",
 };
 
 export const CAL_STATUS = {

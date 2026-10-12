@@ -100,7 +100,7 @@ def reset_backend_state():
     # client exits. Leaving the stale reference behind makes a later
     # test's broadcast target a dead loop.
     main.main_loop = None
-    main._reset_serial_health()
+    main.link.reset()
     audit._pending_throttle = None
     audit._last_logged_us = None
     if main.session_recorder.active:

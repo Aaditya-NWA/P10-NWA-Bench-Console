@@ -67,7 +67,7 @@ def test_simulated_source_feeds_frames_through_the_real_reader(auth_client, stop
 
 def test_replayed_frames_update_the_health_counters(auth_client, stop_reader):
     auth_client.post("/replay/start", json={"mode": "simulate", "rate_hz": 50})
-    assert wait_for(lambda: main.serial_health["frames_total"] >= 10)
+    assert wait_for(lambda: main.link.frames_total >= 10)
 
     health = auth_client.get("/status").json()["health"]
     assert health["frames_total"] >= 10
@@ -93,7 +93,7 @@ def test_simulated_source_answers_commands_with_firmware_event_lines(stop_reader
     conn = replay.ReplaySerial(rate_hz=50)
 
     conn.write(b"T\n")
-    assert json.loads(conn.readline())["event"] == "TARE_DONE"
+    assert json.loads(conn.readline())["event"] == "TARE_STARTED"
 
     conn.write(b"S1450\n")
     ack = json.loads(conn.readline())

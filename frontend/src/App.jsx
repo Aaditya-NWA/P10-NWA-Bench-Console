@@ -5,7 +5,7 @@ import { DEFAULT_UNIT_SYSTEM, convert } from "./units";
 import {
   STORAGE_THEME, STORAGE_UNITS, THEME, THEME_ATTR,
   UNIT_SI, UNIT_KGF, TAB, DIR_CW, DIR_CCW,
-  CHANNEL_TORQUE, CHANNEL_THRUST, THR_MIN,
+  CHANNEL_TORQUE, CHANNEL_THRUST, THR_MIN, CMD_LINK, LINK_VERDICT,
 } from "./constants";
 import LoginScreen        from "./components/LoginScreen";
 import StatusBar          from "./components/StatusBar";
@@ -54,7 +54,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const {
-    latest, history, connected, tareStatus, sendTare, sendThrottle,
+    latest, history, connected, tareStatus, tareResult, sendTare, sendThrottle,
     confirmedThrottleUs,
     ports, refreshPorts, serialConnected, serialPort, serialError,
     connectSerial, disconnectSerial,
@@ -130,13 +130,22 @@ export default function App() {
   const torqueDisp = convert(unitSystem, CHANNEL_TORQUE, torque);
   const thrustDisp = convert(unitSystem, CHANNEL_THRUST, thrust);
 
-  // Three genuinely different failures that all used to look like "the
-  // numbers stopped": browser lost the backend, backend lost the ESP32,
-  // or the port is open but no frames are arriving.
+  // Genuinely different failures that all used to look like "the numbers
+  // stopped" — or, for the last one, like nothing at all: browser lost
+  // the backend, backend lost the ESP32, the port is open but no frames
+  // arrive, or frames arrive but commands don't get back to the board.
+  //
+  // A stall while the ESP32 is booting (right after connecting, or
+  // after a reset) is expected and shown as a warning, not a fault. An
+  // older backend sends no `verdict`, so a stall there stays an error.
+  const bootStall = health?.stalled && health.verdict && health.verdict !== LINK_VERDICT.ERROR;
   const linkProblem =
     !connected      ? { text: "Disconnected from the backend — retrying every 2 seconds. The bench is not being commanded.", severity: "error" }
   : !serialConnected ? { text: "Backend is running but no ESP32 is connected — select a COM port above.", severity: "warn" }
+  : bootStall        ? { text: health.issues?.[0]?.text ?? "Waiting for the ESP32 to start sending telemetry.", severity: "warn" }
   : health?.stalled  ? { text: `Serial port is open but no telemetry has arrived for ${health.last_frame_age_s ?? "?"}s — check power to the board and the TX line.`, severity: "error" }
+  : health?.command_link?.state === CMD_LINK.LOST
+    ? { text: "Telemetry is arriving, but the ESP32 has stopped answering — tare, throttle and CUT may not be reaching it. Check the adapter TX → ESP32 RX (GPIO44) wire.", severity: "error" }
   : null;
 
   // Nothing below renders until an operator is signed in — every control
@@ -168,8 +177,11 @@ export default function App() {
         wsConnected={connected}
         stable={stable}
         health={health}
+        latest={latest}
+        history={history}
         commandsMayBeIgnored={commandsMayBeIgnored}
         tareStatus={tareStatus}
+        tareResult={tareResult}
         onTare={sendTare}
         ports={ports}
         refreshPorts={refreshPorts}

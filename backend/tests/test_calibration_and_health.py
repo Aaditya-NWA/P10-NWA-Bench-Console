@@ -171,7 +171,7 @@ def test_health_starts_empty_and_reports_no_stall_when_disconnected(auth_client)
 
 def test_frames_are_counted_and_a_rate_is_derived(auth_client, fake_serial):
     for _ in range(10):
-        main._note_frame()
+        main.link.note_frame({})
         time.sleep(0.01)
 
     health = auth_client.get("/status").json()["health"]
@@ -182,8 +182,7 @@ def test_frames_are_counted_and_a_rate_is_derived(auth_client, fake_serial):
 
 def test_an_open_port_with_no_frames_is_reported_as_stalled(auth_client, fake_serial):
     """The failure this exists for: connected, but the board is dead."""
-    main._note_frame()
-    main.serial_health["last_frame_at"] = time.time() - 5.0    # No data for 5 s
+    main.link.note_frame({}, now=time.monotonic() - 5.0)      # Last data 5 s ago
 
     health = auth_client.get("/status").json()["health"]
     assert health["stalled"] is True
@@ -191,7 +190,8 @@ def test_an_open_port_with_no_frames_is_reported_as_stalled(auth_client, fake_se
 
 
 def test_malformed_lines_are_counted_separately_from_frames(auth_client, fake_serial):
-    main.serial_health["malformed_total"] = 3
+    for _ in range(3):
+        main.link.note_malformed()
     health = auth_client.get("/status").json()["health"]
     assert health["malformed_total"] == 3
     assert health["frames_total"] == 0

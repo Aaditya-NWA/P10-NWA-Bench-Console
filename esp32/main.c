@@ -34,17 +34,20 @@ static const char *TAG = "NWA-BENCH-CONSOLE";
 #define LOOP_TIMING_LOG_EVERY   40       // One timing breakdown every N loops (~2 s), not every cycle
 #define CMD_READ_TIMEOUT_MS     20       // Bounds command latency and lets command_task sleep rather than busy-poll
 
-// Serializes tare (command_task) against per-loop reads
-// (measurement_task) so two tasks never bit-bang the same lines.
-static SemaphoreHandle_t s_bus_mutex;
+// There is no HX711 bus mutex any more: since the tare moved into
+// measurement_task (see LOAD CELL TARE below), that task is the only
+// one that ever clocks the cells.
+//
 // Keeps a command_task event line and a measurement_task telemetry line
 // from interleaving into one corrupted line.
 static SemaphoreHandle_t s_io_mutex;
 // An ADS1115 read is THREE bus transactions (config write, wait, pointer
-// write, read) and is not atomic. Without this, the tare-time current
-// zero-cal in command_task and measurement_task's normal read interleave
-// mid-conversion and one comes back for the wrong channel — which is
+// write, read) and is not atomic. Without this, a zero-cal running in
+// command_task and measurement_task's normal read interleaved
+// mid-conversion and one came back for the wrong channel — which is
 // what made a zero-cal land on garbage (reading -5 A at a true 0 A).
+// The runtime zero-cal now rides on measurement_task's own reads, but
+// the mutex stays so a future second I2C caller can't bring that back.
 static SemaphoreHandle_t s_i2c_mutex;
 
 #define CALIBRATION_MODE   0             // 1 prints raw counts for a calibration run
@@ -190,7 +193,7 @@ static float ema_current_amps = 0.0f;
 static float ema_bus_voltage  = 0.0f;
 static bool  ema_initialized   = false;           // Seeds the EMA rather than ramping it up from zero
 // LIVE zero point (sensor_out_a0 volts at a true 0 A), re-measured on
-// every tare — see ads1115_zero_calibrate_current().
+// every tare — see tare_finish() and, at boot, ads1115_zero_calibrate_current().
 static float s_current_zero_offset_v = CURRENT_ZERO_OFFSET_V;
 
 // Sensor pair #2. These stay at exactly 0.0f while SENSOR2_ENABLED is
@@ -267,8 +270,8 @@ static i2c_master_dev_handle_t s_ads1115_dev = NULL;  // Bound to ADS1115_ADDR o
 #define S2_SCK  7
 #define S3_DT  15                        // S3 right
 #define S3_SCK 16
-#define S4_DT  17                        // S4 left
-#define S4_SCK 18
+#define S4_DT  8                        // S4 left
+#define S4_SCK 3
 
 // ── S-type load cell (thrust) ────────────────────────────────────
 // Uses the struct-based hx711_t driver — both hx711.h AND hx711.c must
@@ -630,6 +633,219 @@ static void beam_tare_all(int samples) {
 }
 
 // ================================================================
+// LOAD CELL TARE — all five cells sampled in PARALLEL
+//
+//   The HX711s convert independently at 10 SPS, so five cells can
+//   deliver five samples every ~100 ms. The old tare read them one
+//   cell at a time — 30 samples from S1, then 30 from S2, … — which
+//   took ~13 s and held the sensor bus for all of it, freezing every
+//   readout on the dashboard. Here each raw conversion the loop
+//   already takes is also folded into a per-cell accumulator, so:
+//     - a tare takes TARE_SAMPLES / 10 SPS ≈ 2 s, whatever the cell count
+//     - telemetry keeps flowing throughout (published against the old
+//       offsets until the new ones are applied in one step)
+//     - all five zeros come from the SAME 2 s window, rather than S4's
+//       being taken ~10 s after S1's
+//
+//   Accuracy: the offset's own uncertainty is sigma/sqrt(N). At N=20
+//   that is ~22% wider than the old 30-sample beam tare, but beam noise
+//   at 10 SPS is a few hundred counts against ~75,000 counts/kg, so it
+//   stays an order of magnitude under the 0.005 kg display dead band.
+//   The thrust cell gets 20 samples where it used to get 10. The
+//   per-cell sigma is reported in TARE_DONE so this is checkable on the
+//   real rig rather than assumed.
+//
+//   Owned entirely by measurement_task (plus the one-off blocking run
+//   at boot, before that task exists): command_task only raises
+//   s_tare_requested. No accumulator is ever touched by two tasks.
+// ================================================================
+#define TARE_SAMPLES        20           // Per load cell, ~2 s at 10 SPS
+#define TARE_MIN_SAMPLES     5           // Below this a cell keeps its previous zero
+#define TARE_TIMEOUT_MS   4000           // 2x the expected duration
+#define TARE_CELLS           5           // S1-S4, then the thrust cell
+#define TARE_THRUST          4
+
+typedef struct {
+    long   ref;                          // First sample; the rest accumulate as deviations from it,
+                                         //   which keeps the variance sum free of float cancellation
+    double sum, sumsq;
+    int    n;
+} tare_acc_t;
+
+static const char *const TARE_CELL_KEYS[TARE_CELLS] = { "s1", "s2", "s3", "s4", "thrust" };
+
+static tare_acc_t    s_tare_acc[TARE_CELLS];
+static double        s_tare_cur_sum  = 0.0;   // sensor_out_a0 volts, for the current zero
+static int           s_tare_cur_n    = 0;
+static double        s_tare_cur2_sum = 0.0;   // Pair #2; only fed while SENSOR2_ENABLED
+static int           s_tare_cur2_n   = 0;
+static bool          s_tare_active   = false;
+static bool          s_tare_with_current = false;
+static int64_t       s_tare_started_us = 0;
+static volatile bool s_tare_requested = false; // Raised by command_task, consumed by measurement_task
+
+static void tare_begin(bool with_current) {
+    memset(s_tare_acc, 0, sizeof(s_tare_acc));
+    s_tare_cur_sum  = 0.0; s_tare_cur_n  = 0;
+    s_tare_cur2_sum = 0.0; s_tare_cur2_n = 0;
+    s_tare_with_current = with_current;
+    s_tare_started_us   = esp_timer_get_time();
+    s_tare_active       = true;
+}
+
+// Capped at TARE_SAMPLES so every cell's zero is averaged over the same
+// count, even though a cell that converts slightly faster gets there first.
+static void tare_add(int cell, long raw) {
+    if (!s_tare_active) return;
+    tare_acc_t *a = &s_tare_acc[cell];
+    if (a->n >= TARE_SAMPLES) return;
+    if (a->n == 0) a->ref = raw;
+    double d = (double)(raw - a->ref);
+    a->sum   += d;
+    a->sumsq += d * d;
+    a->n++;
+}
+
+static void tare_add_current(int pair, float sensor_out_v) {
+    if (!s_tare_active || !s_tare_with_current) return;
+    if (pair == 1 && s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) {
+        s_tare_cur_sum += sensor_out_v; s_tare_cur_n++;
+    } else if (pair == 2 && s_tare_cur2_n < CURRENT_ZERO_CAL_SAMPLES) {
+        s_tare_cur2_sum += sensor_out_v; s_tare_cur2_n++;
+    }
+}
+
+static bool tare_complete(void) {
+    for (int i = 0; i < TARE_CELLS; i++)
+        if (s_tare_acc[i].n < TARE_SAMPLES) return false;
+    if (s_tare_with_current) {
+        if (s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) return false;
+#if SENSOR2_ENABLED
+        if (s_tare_cur2_n < CURRENT_ZERO_CAL_SAMPLES) return false;
+#endif
+    }
+    return true;
+}
+
+static bool tare_timed_out(void) {
+    return (esp_timer_get_time() - s_tare_started_us) > (int64_t)TARE_TIMEOUT_MS * 1000;
+}
+
+// Old samples in the smoothing and stability windows were measured
+// against the old zero. Left in place they make a fresh tare ease toward
+// 0 over ~0.5 s instead of landing on it.
+static void ch_reset_filters(Chan *c) {
+    c->sm_idx = 0; c->sm_filled = 0;
+    c->st_idx = 0; c->st_filled = 0;
+}
+
+// Applies whatever was gathered and, when emit_event is set, reports it
+// as one TARE_DONE line. A cell short of TARE_MIN_SAMPLES keeps its
+// previous offset and is named in "failed" — the old blocking tare
+// silently set the offset to 0 when every read of a cell timed out,
+// which turned a disconnected cell into a large, believable reading.
+static void tare_finish(bool emit_event) {
+    s_tare_active = false;
+    int64_t elapsed_ms = (esp_timer_get_time() - s_tare_started_us) / 1000;
+
+    bool  cell_ok[TARE_CELLS];
+    float sd_kg[TARE_CELLS];
+    bool  all_ok = true;
+    for (int i = 0; i < TARE_CELLS; i++) {
+        const tare_acc_t *a = &s_tare_acc[i];
+        cell_ok[i] = a->n >= TARE_MIN_SAMPLES;
+        sd_kg[i]   = 0.0f;
+        if (!cell_ok[i]) { all_ok = false; continue; }
+
+        double mean = a->sum / a->n;
+        double var  = a->sumsq / a->n - mean * mean;
+        if (var < 0.0) var = 0.0;
+        long  offset = a->ref + lround(mean);
+        float scale  = (i == TARE_THRUST) ? thrust_cell.scale : s_cal.cal_kg[i];
+        sd_kg[i] = (float)(sqrt(var) / fabs((double)scale));
+
+        if (i == TARE_THRUST) {
+            thrust_cell.offset = offset;
+        } else {
+            CH[i].offset = offset;
+            ch_reset_filters(&CH[i]);
+        }
+    }
+
+    bool current_ok = true;
+    if (s_tare_with_current) {
+        if (s_tare_cur_n > 0) {
+            s_current_zero_offset_v = (float)(s_tare_cur_sum / s_tare_cur_n);
+            ema_current_amps   = 0.0f;              // Snapped, not decayed toward zero over several EMA cycles
+            s_current_hist_n   = 0;                 // Its history is in amps against the OLD zero; left in,
+            s_current_hist_idx = 0;                 //   the despike filter would reject the first few new samples
+        } else {
+            current_ok = false;
+        }
+#if SENSOR2_ENABLED
+        if (s_tare_cur2_n > 0) {
+            s_current2_zero_offset_v = (float)(s_tare_cur2_sum / s_tare_cur2_n);
+            ema_current2_amps   = 0.0f;
+            s_current2_hist_n   = 0;
+            s_current2_hist_idx = 0;
+        } else {
+            current_ok = false;
+        }
+#endif
+    }
+
+    ESP_LOGI(TAG, "Tare %s in %lld ms: S1=%ld S2=%ld S3=%ld S4=%ld thrust=%ld (n=%d/%d/%d/%d/%d) current_zero=%.5f V",
+             all_ok && current_ok ? "done" : "PARTIAL", (long long)elapsed_ms,
+             CH[0].offset, CH[1].offset, CH[2].offset, CH[3].offset, thrust_cell.offset,
+             s_tare_acc[0].n, s_tare_acc[1].n, s_tare_acc[2].n, s_tare_acc[3].n, s_tare_acc[4].n,
+             (double)s_current_zero_offset_v);
+
+    if (!emit_event) return;
+
+    // ~230 bytes at most. Built first, printed under the mutex in one go.
+    char body[320];
+    int  n = 0;
+    for (int i = 0; i < TARE_CELLS && n < (int)sizeof(body); i++) {
+        n += snprintf(body + n, sizeof(body) - n, "%s\"%s\":{\"n\":%d,\"sd_kg\":%.5f}",
+                      i ? "," : "", TARE_CELL_KEYS[i], s_tare_acc[i].n, (double)sd_kg[i]);
+    }
+    char failed[64];
+    int  f = 0;
+    failed[0] = '\0';
+    for (int i = 0; i < TARE_CELLS && f < (int)sizeof(failed); i++) {
+        if (!cell_ok[i])
+            f += snprintf(failed + f, sizeof(failed) - f, "%s\"%s\"", f ? "," : "", TARE_CELL_KEYS[i]);
+    }
+    if (s_tare_with_current && !current_ok && f < (int)sizeof(failed))
+        f += snprintf(failed + f, sizeof(failed) - f, "%s\"current\"", f ? "," : "");
+
+    if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
+        printf("{\"event\":\"TARE_DONE\",\"ok\":%s,\"ms\":%lld,\"samples\":%d,\"cells\":{%s},\"failed\":[%s]}\n",
+               all_ok && current_ok ? "true" : "false", (long long)elapsed_ms, TARE_SAMPLES, body, failed);
+        xSemaphoreGive(s_io_mutex);
+    }
+}
+
+// Boot only: nothing is publishing yet, so there is no loop to ride on.
+// Same accumulator and the same parallel sampling — ~2 s, where the old
+// one-cell-at-a-time boot tare took ~13 s. The current zero is taken
+// separately at boot by ads1115_zero_calibrate_current().
+static void tare_run_blocking(void) {
+    tare_begin(false);
+    while (!tare_complete() && !tare_timed_out()) {
+        for (int i = 0; i < 4; i++) {
+            int32_t raw;
+            if (gpio_get_level(DT[i]) == 0 && beam_hx711_read(DT[i], SCK[i], &raw))
+                tare_add(i, raw);
+        }
+        if (hx711_is_ready(&thrust_cell))
+            tare_add(TARE_THRUST, hx711_read(&thrust_cell));
+        vTaskDelay(1);                                       // At least one tick, so the idle task (and its watchdog) still runs
+    }
+    tare_finish(false);
+}
+
+// ================================================================
 // READ ALL 4 BEAM CELLS → kg[]
 // ================================================================
 // Carried forward on cycles where that cell's HX711 hasn't finished its
@@ -645,6 +861,7 @@ static void read_all_kg(float kg[4]) {
         if (gpio_get_level(DT[i]) == 0) {
             int32_t raw;
             if (beam_hx711_read(DT[i], SCK[i], &raw)) {
+                tare_add(i, raw);                                // No-op unless a tare is collecting
                 float w = (float)(raw - CH[i].offset) / CAL[i];  // Tare-corrected counts to kg
                 switch (i) {
                     case 0: w = correct_S1(w); break;
@@ -668,7 +885,9 @@ static float last_thrust_kg = 0.0f;
 
 static float read_thrust_kg(void) {
     if (hx711_is_ready(&thrust_cell)) {
-        long diff = hx711_read(&thrust_cell) - thrust_cell.offset;
+        long raw  = hx711_read(&thrust_cell);
+        tare_add(TARE_THRUST, raw);                           // No-op unless a tare is collecting
+        long diff = raw - thrust_cell.offset;
         float w   = (float)diff / thrust_cell.scale;
         w         = thrust_linearity_correction(w);
         if (fabsf(w) < 0.05f) w = 0.0f;                      // Dead band
@@ -863,6 +1082,7 @@ static void ads1115_read_current_voltage(float *out_current_amps, float *out_vol
     if (ads1115_read_channel(4, &raw_a0)) {
         float node_volts_a0   = raw_a0 * ADS_LSB;                      // Counts to volts at the ADC pin
         float sensor_out_a0   = (node_volts_a0 * NETWORK_GAIN) - NETWORK_OFFSET;  // Undo the resistor network
+        tare_add_current(1, sensor_out_a0);                                    // Collected for the new zero during a tare
         float current_amps_raw = (sensor_out_a0 - s_current_zero_offset_v) * s_cal.current_scale;  // LIVE, tare-updated zero point
 
         s_dbg_raw_a0 = raw_a0; s_dbg_node_v_a0 = node_volts_a0; s_dbg_sensor_out_a0 = sensor_out_a0;  // For the [ADS DEBUG] log
@@ -916,6 +1136,7 @@ static void ads1115_read_current_voltage_2(float *out_current2_amps, float *out_
     if (ads1115_read_channel(6, &raw_a2)) {
         float node_volts_a2    = raw_a2 * ADS_LSB;
         float sensor_out_a2    = (node_volts_a2 * NETWORK2_GAIN) - NETWORK2_OFFSET;
+        tare_add_current(2, sensor_out_a2);
         float current2_amps_raw = (sensor_out_a2 - s_current2_zero_offset_v) * s_cal.current2_scale;
 
         if (despike_check(s_current2_hist, &s_current2_hist_n, &s_current2_hist_idx, current2_amps_raw, DESPIKE_MAD_FLOOR_A)) {
@@ -952,7 +1173,12 @@ static void ads1115_read_current_voltage_2(float *out_current2_amps, float *out_
 }
 
 // ================================================================
-// CURRENT SENSOR ZERO CALIBRATION  (runs on every tare)
+// CURRENT SENSOR ZERO CALIBRATION  (boot only)
+//   A runtime "T" takes the same zero from measurement_task's own A0
+//   reads instead (tare_add_current), so it costs no extra I2C time and
+//   can't contend with the loop for the bus. This blocking version is
+//   for boot, before that loop exists.
+//
 //   Re-measures sensor_out_a0 — the sensor's output after undoing the
 //   resistor network, before the gain — and stores it as the new zero
 //   point. Only valid when the motor is genuinely stationary and
@@ -1065,6 +1291,19 @@ static void esc_arm(void) {
 //   UART_NUM_0 and the pins below if the adapter is elsewhere.
 //   CMakeLists.txt needs `esp_driver_uart` in REQUIRES/PRIV_REQUIRES.
 // ================================================================
+// ── Link-health counters ─────────────────────────────────────────
+// Reported in every PONG, so the dashboard can see the link from the
+// ESP32's side too — the backend alone can only see what arrives at
+// the PC, never what was lost on the way IN to the board. Each is
+// written by one task and read by command_task; a 32-bit aligned load
+// or store is atomic on the ESP32, so no lock is needed.
+static QueueHandle_t     s_uart_evt_queue    = NULL;
+static volatile uint32_t s_uart_rx_overflows = 0;  // FIFO overflow / RX ring full: command bytes were DROPPED
+static volatile uint32_t s_uart_rx_errors    = 0;  // Framing/parity errors: noise on the adapter-TX → GPIO44 wire, or a baud mismatch
+static volatile uint32_t s_bad_commands      = 0;  // Lines that were not a known command, or overran cmd_buf
+static volatile uint32_t s_loop_overruns     = 0;  // measurement_task cycles longer than TELEMETRY_PERIOD_MS
+static uint32_t          s_frame_seq         = 0;  // Telemetry sequence number; a gap at the PC is a dropped frame
+
 static void uart_cmd_init(void) {
     const uart_port_t port = UART_NUM_0;
     uart_config_t cfg = {
@@ -1075,7 +1314,10 @@ static void uart_cmd_init(void) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t err = uart_driver_install(port, 256, 512, 0, NULL, 0);   // rx_buf, tx_buf
+    // The event queue exists only so command_task can COUNT overflow
+    // and framing errors; the bytes themselves are still read with
+    // uart_read_bytes(). 16 deep is plenty when it's drained every 20 ms.
+    esp_err_t err = uart_driver_install(port, 256, 512, 16, &s_uart_evt_queue, 0);   // rx_buf, tx_buf, event queue
     if (err == ESP_OK) err = uart_param_config(port, &cfg);
     if (err == ESP_OK) err = uart_set_pin(port, GPIO_NUM_43, GPIO_NUM_44, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err == ESP_OK) {
@@ -1169,6 +1411,10 @@ static const char *cal_apply(const char *key, const char *value_str, float *out_
 // ================================================================
 // COMMAND PROTOCOL — newline-terminated ASCII lines over UART0
 //     "T"          → re-tare all load cells and the current sensor
+//                    (TARE_STARTED now, TARE_DONE ~2 s later)
+//     "P<n>"       → link check; answered at once with PONG n plus the
+//                    counters above, so the PC can time the round trip
+//                    and knows its commands are actually arriving
 //     "S<us>"      → set ESC throttle, e.g. "S1300"
 //     "C"          → dump the runtime calibration table (two event lines)
 //     "C<key>=<v>" → set one value, e.g. "Cthrust_scale=18178.5"
@@ -1181,20 +1427,30 @@ static int64_t s_cmd_recv_start_us = 0;
 
 static void handle_command_line(const char *line) {
     if (line[0] == 'T' && line[1] == '\0') {
-        ESP_LOGI(TAG, "Tare command received — re-taring all cells");
-        if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-            beam_tare_all(30);
-            hx711_tare(&thrust_cell, 10);
-            xSemaphoreGive(s_bus_mutex);
-        } else {
-            ESP_LOGE(TAG, "Tare skipped — sensor bus busy (measurement loop didn't release in time)");
-        }
-        // On the I2C bus, not the HX711 GPIO bus s_bus_mutex guards, so
-        // no mutex needed — but it does need the motor to genuinely be
-        // at 0 A, the same assumption as "remove all loads" above.
-        ads1115_zero_calibrate_current(CURRENT_ZERO_CAL_SAMPLES);
+        // Only a request: measurement_task does the sampling with the
+        // reads it already takes, and sends TARE_DONE when every cell
+        // has its samples. A "T" while one is running restarts it.
+        // Still assumes no load on the cells and the motor genuinely at
+        // 0 A, same as ever.
+        ESP_LOGI(TAG, "Tare command received — collecting %d samples per cell", TARE_SAMPLES);
+        s_tare_requested = true;
         if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
-            printf("{\"event\":\"TARE_DONE\"}\n");
+            printf("{\"event\":\"TARE_STARTED\",\"samples\":%d,\"timeout_ms\":%d}\n",
+                   TARE_SAMPLES, TARE_TIMEOUT_MS);
+            xSemaphoreGive(s_io_mutex);
+        }
+    }
+    else if (line[0] == 'P') {
+        // Answered here in command_task, at its higher priority, so the
+        // round trip measures the link and the command path — not how
+        // far through a sensor read measurement_task happened to be.
+        unsigned long n = strtoul(line + 1, NULL, 10);
+        if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
+            printf("{\"event\":\"PONG\",\"n\":%lu,\"up_ms\":%lld,"
+                   "\"rx_ovf\":%lu,\"rx_err\":%lu,\"bad_cmd\":%lu,\"late\":%lu}\n",
+                   n, (long long)(esp_timer_get_time() / 1000),
+                   (unsigned long)s_uart_rx_overflows, (unsigned long)s_uart_rx_errors,
+                   (unsigned long)s_bad_commands, (unsigned long)s_loop_overruns);
             xSemaphoreGive(s_io_mutex);
         }
     }
@@ -1209,9 +1465,9 @@ static void handle_command_line(const char *line) {
         ESP_LOGI(TAG, "[TIMING] throttle cmd -> applied in %lld us (target %d us, confirmed %d us)",
                  (long long)latency_us, us, current_throttle_us);
     }
-    // Handled in command_task, not measurement_task, for the same
-    // reason tare is: an NVS commit is single-digit milliseconds of
-    // flash write and must not land inside the paced sensor loop.
+    // Handled in command_task, not measurement_task: an NVS commit is
+    // single-digit milliseconds of flash write and must not land
+    // inside the paced sensor loop.
     else if (line[0] == 'C') {
         if (line[1] == '\0') {
             cal_report_all();                               // "C" — what is the device using?
@@ -1267,6 +1523,26 @@ static void handle_command_line(const char *line) {
             }
         }
     }
+    else {
+        // Counted rather than answered: a garbled line is a symptom of
+        // the link, and the PONG counters are where that shows up.
+        s_bad_commands++;
+        ESP_LOGW(TAG, "Unknown command ignored: %s", line);
+    }
+}
+
+static void uart_count_events(void) {
+    if (s_uart_evt_queue == NULL) return;
+    uart_event_t ev;
+    while (xQueueReceive(s_uart_evt_queue, &ev, 0) == pdTRUE) {
+        switch (ev.type) {
+            case UART_FIFO_OVF:
+            case UART_BUFFER_FULL:  s_uart_rx_overflows++; break;
+            case UART_FRAME_ERR:
+            case UART_PARITY_ERR:   s_uart_rx_errors++;    break;
+            default:                                       break;   // UART_DATA etc. — nothing to count
+        }
+    }
 }
 
 static void process_command_byte(uint8_t byte) {
@@ -1287,6 +1563,7 @@ static void process_command_byte(uint8_t byte) {
         cmd_buf[cmd_buf_len++] = (char)byte;
     } else {
         cmd_buf_len = 0;
+        s_bad_commands++;                                    // Overran the buffer — dropped
     }
 }
 
@@ -1297,6 +1574,7 @@ static void command_task(void *arg) {
         for (int i = 0; i < len; i++) {
             process_command_byte(buf[i]);
         }
+        uart_count_events();
     }
 }
 
@@ -1354,9 +1632,7 @@ static void run_measurement_setup(void) {
     printf("  Remove all loads. Taring in 5 s...\n\n");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    beam_tare_all(30);
-    hx711_tare(&thrust_cell, 10);
-    ESP_LOGI(TAG, "Thrust tare offset = %ld", thrust_cell.offset);
+    tare_run_blocking();                                         // All five cells in parallel, ~2 s
 
     ads1115_zero_calibrate_current(CURRENT_ZERO_CAL_SAMPLES);   // At boot too, not just on "T" — same "remove all loads" window
 }
@@ -1371,23 +1647,27 @@ static void measurement_task(void *arg) {
     while (1) {
         int64_t t_loop_start = esp_timer_get_time();
 
-        float kg[4];
-        float thrust_N = 0.0f;
-        int64_t t_beam_done = t_loop_start, t_thrust_done = t_loop_start;
-        if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-            read_all_kg(kg);
-            t_beam_done = esp_timer_get_time();
-
-            float thrust_kg = read_thrust_kg();
-            thrust_N = thrust_kg * GRAVITY;
-            t_thrust_done = esp_timer_get_time();
-            xSemaphoreGive(s_bus_mutex);
-        } else {
-            for (int i = 0; i < 4; i++) kg[i] = last_kg[i];
-            thrust_N = last_thrust_kg * GRAVITY;
-            t_beam_done = t_thrust_done = esp_timer_get_time();
-            ESP_LOGW(TAG, "Measurement loop: sensor bus busy (tare in progress), publishing cached values this cycle");
+        // Finished at the TOP of a cycle, before this cycle's reads: the
+        // previous frame went out on the old zero, so applying the new
+        // offsets here means the first frame after TARE_DONE is already
+        // on the new one, with no stale frame in between.
+        if (s_tare_active && (tare_complete() || tare_timed_out())) {
+            tare_finish(true);
         }
+        // Picked up here too, so the accumulators are only ever touched
+        // from this task.
+        if (s_tare_requested) {
+            s_tare_requested = false;
+            tare_begin(true);
+        }
+
+        float kg[4];
+        read_all_kg(kg);                                     // Also feeds a running tare
+        int64_t t_beam_done = esp_timer_get_time();
+
+        float thrust_kg = read_thrust_kg();
+        float thrust_N  = thrust_kg * GRAVITY;
+        int64_t t_thrust_done = esp_timer_get_time();
 
         // Direction from S3, with hysteresis
         if (kg[2] > TQ_HYST_KG) {
@@ -1431,7 +1711,7 @@ static void measurement_task(void *arg) {
                    "\"rpm\":%.1f,\"rpm_raw\":%.1f,"
                    "\"current_a\":%.2f,\"voltage_v\":%.2f,"
                    "\"current_a2\":%.2f,\"voltage_v2\":%.2f,"
-                   "\"throttle_us\":%d}\n",
+                   "\"throttle_us\":%d,\"seq\":%lu}\n",
                    stable ? sv_tau : tau_Nm,
                    thrust_N,
                    kg[0], kg[1], kg[2], kg[3],
@@ -1443,11 +1723,16 @@ static void measurement_task(void *arg) {
                    voltage_v,
                    current2_amps,
                    voltage2_v,
-                   current_throttle_us);
+                   current_throttle_us,
+                   (unsigned long)s_frame_seq);
             xSemaphoreGive(s_io_mutex);
         }
+        s_frame_seq++;                                       // Wraps at 2^32 (~6.8 years at 20 Hz); the backend handles it
 
         int64_t t_loop_end = esp_timer_get_time();
+        if (t_loop_end - t_loop_start > (int64_t)TELEMETRY_PERIOD_MS * 1000) {
+            s_loop_overruns++;                               // This cycle alone used up the whole 50 ms budget
+        }
         loop_n++;
         if (loop_n >= LOOP_TIMING_LOG_EVERY) {
             loop_n = 0;
@@ -1476,6 +1761,24 @@ static void measurement_task(void *arg) {
 // ================================================================
 // ENTRY POINT
 // ================================================================
+// Stable names for the BOOT event — the enum's numeric values are an
+// IDF implementation detail and not something the dashboard should key on.
+static const char *reset_reason_key(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON";        // Also what an adapter's DTR/RTS auto-reset looks like
+        case ESP_RST_EXT:       return "EXTERNAL";
+        case ESP_RST_SW:        return "SOFTWARE";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "OTHER";
+    }
+}
+
 void app_main(void) {
     // Check this line first if the ESC or sensors misbehave. On a
     // current-limited UART adapter's power pin, a brownout under load
@@ -1491,6 +1794,12 @@ void app_main(void) {
              "other");
 
     uart_cmd_init();
+
+    // A machine-readable twin of the log line above. A brownout
+    // mid-run otherwise looks, from the PC, like a ~15 s stall followed
+    // by normal data — with the tare and throttle state silently lost.
+    // No other task exists yet, so no s_io_mutex (it isn't created yet either).
+    printf("{\"event\":\"BOOT\",\"reason\":\"%s\"}\n", reset_reason_key(reset_reason));
 
     // Must run before the first sensor read, so the very first frame
     // already uses the operator's stored values rather than briefly
@@ -1539,7 +1848,6 @@ void app_main(void) {
 #if CALIBRATION_MODE
     run_calibration();
 #else
-    s_bus_mutex = xSemaphoreCreateMutex();
     s_io_mutex  = xSemaphoreCreateMutex();
     s_i2c_mutex = xSemaphoreCreateMutex();
 

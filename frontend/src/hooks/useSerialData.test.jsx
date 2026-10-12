@@ -168,6 +168,64 @@ describe("acknowledgement routing", () => {
 });
 
 
+// The tare now runs ~2 s inside the firmware's measurement loop and is
+// reported as TARE_STARTED → TARE_DONE.
+describe("tare progress", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("holds 'sent' until the firmware answers instead of clearing after 3 s", async () => {
+    // BUG: the ack scheduled a 3 s clear, which fired mid-tare (the old
+    // firmware took ~13 s) and re-enabled the button while the cells
+    // were still being zeroed.
+    const { result } = await renderSerialHook();
+    vi.useFakeTimers();
+    act(() => MockWebSocket.latest.open());
+
+    act(() => MockWebSocket.latest.receive({ type: "ack", action: "tare", status: "sent" }));
+    act(() => { vi.advanceTimersByTime(5000); });
+
+    expect(result.current.tareStatus).toBe("sent");
+  });
+
+  it("shows TARE_STARTED as taring, and is not knocked back by a late ack", async () => {
+    const { result } = await renderSerialHook();
+    act(() => MockWebSocket.latest.open());
+    const socket = MockWebSocket.latest;
+
+    act(() => socket.receive({ event: "TARE_STARTED", samples: 20 }));
+    act(() => socket.receive({ type: "ack", action: "tare", status: "sent" }));
+
+    expect(result.current.tareStatus).toBe("taring");
+  });
+
+  it("carries the per-cell result of TARE_DONE", async () => {
+    const { result } = await renderSerialHook();
+    act(() => MockWebSocket.latest.open());
+
+    act(() => MockWebSocket.latest.receive({
+      event: "TARE_DONE", ok: false, ms: 4001, samples: 20, failed: ["s4"],
+      cells: { s1: { n: 20, sd_kg: 0.0003 }, s4: { n: 0, sd_kg: 0 } },
+    }));
+
+    expect(result.current.tareStatus).toBe("done");
+    expect(result.current.tareResult.failed).toEqual(["S4"]);
+  });
+
+  it("keeps unrecognised firmware events out of the telemetry history", async () => {
+    // BOOT (and anything a newer build adds) used to fall through to the
+    // telemetry branch and land in `latest` and the chart as a blank point.
+    const { result } = await renderSerialHook();
+    act(() => MockWebSocket.latest.open());
+
+    act(() => MockWebSocket.latest.receive({ event: "BOOT", reason: "BROWNOUT" }));
+    act(() => MockWebSocket.latest.receive({ event: "TARE_STARTED", samples: 20 }));
+
+    expect(result.current.history).toHaveLength(0);
+    expect(result.current.latest).toBeNull();
+  });
+});
+
+
 // #34 — old-firmware detection from the absence of `stable`
 describe("firmware build detection", () => {
   it("treats a frame without `stable` as the RPM-test-pass build", async () => {
