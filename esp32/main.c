@@ -62,7 +62,8 @@ static SemaphoreHandle_t s_i2c_mutex;
 #define RPM_PIN               1          // Via a CD4050BE level shifter
 #define SLOTS_PER_REV         1          // Slot interrupts per revolution — raise if the disc has more
 // RPM comes from the period between consecutive pulses, not a fixed
-// window — see RPM_DEBOUNCE_US / RPM_STALL_TIMEOUT_MS by rpm_read().
+// window. Pulse rejection follows the speed (see the RPM tuning block
+// above rpm_isr_handler()); there is no fixed debounce time any more.
 
 // ── ESC / throttle (U15II KV100 via a standard PWM ESC) ──────────
 // No UI arm/disarm gate: the ESC arming handshake runs automatically on
@@ -80,7 +81,9 @@ static volatile int current_throttle_us = THR_MIN;
 
 // ================================================================
 // ADS1115 — CURRENT + VOLTAGE  (HAS-600S current, LV25-P voltage)
-//   A0 = current, A1 = voltage, both via a resistor network.
+//   A0 = VOLTAGE (LV25-P), A1 = CURRENT (HAS-600S), both via a
+//   resistor network. (Swapped from the original A0=current/A1=voltage
+//   to match the bench wiring.)
 //
 //   Analog front end (bipolar ±15V supply, star ground):
 //     - Two Mean Well RS-15-15 units make the ±15V rails, Unit A -V
@@ -88,9 +91,9 @@ static volatile int current_throttle_us = THR_MIN;
 //       to ESP32 GND.
 //     - HAS-600S: ± to the rails, 0 to common, OUT through a 100k into
 //       a 3-resistor divider joint (100k from sensor, 68k to 3.3V,
-//       220k to common) landing on A0.
+//       220k to common) landing on A1.
 //     - LV25-P: same rails, VOUT through its own 100k into an
-//       identical 68k/220k joint, landing on A1.
+//       identical 68k/220k joint, landing on A0.
 //     - ADS1115 VDD=3.3V, ADDR=GND (locks the address to 0x48).
 //
 //   The firmware only needs NETWORK_GAIN/NETWORK_OFFSET below, which
@@ -99,11 +102,15 @@ static volatile int current_throttle_us = THR_MIN;
 //   stay valid only for THIS exact resistor/rail setup. Don't change
 //   them without re-deriving from fresh reference readings.
 // ================================================================
-#define I2C_MASTER_SCL_IO          41
-#define I2C_MASTER_SDA_IO          40
+#define I2C_MASTER_SCL_IO          40
+#define I2C_MASTER_SDA_IO          39
 #define I2C_MASTER_NUM    I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ    100000
 #define ADS1115_ADDR             0x48    // ADDR pin tied to GND
+
+// ADS1115 single-ended MUX codes for the two channels in use
+#define ADS_MUX_VOLTAGE          4       // A0 — LV25-P
+#define ADS_MUX_CURRENT          5       // A1 — HAS-600S
 
 #define ADS_LSB              0.000125f   // LSB size for the ±4.096V PGA range
 
@@ -121,8 +128,8 @@ static volatile int current_throttle_us = THR_MIN;
 #define CURRENT_DEADBAND_A        0.05f  // Clamps residual post-tare creep to exactly 0.00 A
 
 // LV25-P
-#define VOLTAGE_ZERO_OFFSET_V     0.0f
-#define VOLTAGE_SCALE            62.51f   // 2 - input
+#define VOLTAGE_ZERO_OFFSET_V     0.0981f
+#define VOLTAGE_SCALE            70.36f   // 2 - input
                                           // [FLAG] KNOWN WRONG. This was a single-point rescale
                                           // (46.19 * 48.2 actual / 35.62 measured), and the bench now
                                           // reports ~5-6V against a real 48V bus — roughly 8.7x out,
@@ -133,46 +140,89 @@ static volatile int current_throttle_us = THR_MIN;
                                           // invalidate NETWORK_GAIN/NETWORK_OFFSET too.
                                           // DO NOT rescale from one data point again: use the periodic
                                           // [ADS DEBUG] log line in measurement_task to capture
-                                          // sensor_out_a1 at two multimeter-verified bus voltages, and
-                                          // re-derive the divider constants and this scale properly.
+                                          // the voltage channel's sensor_out at two multimeter-verified
+                                          // bus voltages, and re-derive the divider constants and this
+                                          // scale properly.
 
 #define EMA_ALPHA_CURRENT        0.15f
 #define EMA_ALPHA_VOLTAGE        0.08f   // Heavier than current: the bus voltage is slow-moving DC
 
 // ================================================================
-// SECOND CURRENT + VOLTAGE PAIR  (ADS1115 A2 / A3)
+// CURRENT SENSORS #2, #3, #4 — three LEM DHR 300 C10 on a SECOND ADS1115
 //
-//   The hardware is not installed yet, so SENSOR2_ENABLED is 0 and the
-//   firmware publishes a hard 0.00 for current_a2 / voltage_v2. The
-//   fields are always in the telemetry frame regardless, so the
-//   dashboard and CSV columns stay aligned from day one — flipping
-//   this flag is the only change needed once the sensors are wired.
+//   Published as current_a2 / current_a3 / current_a4 in every telemetry
+//   frame. voltage_v2 is the bus voltage from an LV25-P on A3 of the same
+//   ADS1115 (see the VOLTAGE block below).
 //
-//   A COMPILE FLAG, NOT AUTO-DETECTION: an ADS1115 input with nothing
-//   attached is a floating pin. It reads drifting garbage (railing
-//   toward VDD through the leakage path), NOT zero, so "is a sensor
-//   connected?" can't be answered from the reading. Skipping the reads
-//   entirely is both honest and free.
+//     ADS1115 #2 input   telemetry field   CSV column (once the backend has it)
+//     A0                 current_a2        Current 2 (A)
+//     A1                 current_a3        Current 3 (A)
+//     A2                 current_a4        Current 4 (A)
+//     A3  (LV25-P)       voltage_v2        Voltage 2 (V)   <- the CSV already has this column
 //
-//   COST WHEN ENABLED: each read costs ~10 ms of single-shot
-//   conversion wait plus I2C overhead. Two extra channels is ~20-25 ms
-//   of the 50 ms budget; four is essentially all of it, dragging the
-//   rate below the 20 Hz target. Switch the ADS1115 to round-robin
-//   (one channel per loop, each refreshing at 5 Hz — current and bus
-//   voltage are slow signals) before turning this on for real testing.
+//   Wiring, per sensor (power everything off before touching it):
+//     DHR 300 C10   +  -> +24 V     NC -> unused
+//                   M  -> its OWN DFR0051 input signal pin (printed "VCC")
+//                   GND-> DFR0051 input GND
+//     DFR0051 S   -> the ADS1115 #2 input above;  DFR0051 GND -> ADS1115 #2 GND
+//     ADS1115 #2: VDD 3.3 V, ADDR -> GND (address 0x48),
+//                 SDA -> GPIO41, SCL -> GPIO42
+//     NEVER connect an M output straight to an ADS input: M goes up to 10 V
+//     and the ADS1115 (powered from 3.3 V) tops out at 3.6 V.
+//     The 24 V supply's 0 V, every DHR GND, every divider, ADS1115 #2 and
+//     the ESP32 must all share ONE ground.
+//   ADS1115 #2 sits on its own I2C controller (I2C_NUM_1), so having the
+//   same address 0x48 as ADS1115 #1 on I2C_NUM_0 is not a conflict.
 //
-//   CALIBRATION: the constants below mirror the sensor-1 values as a
-//   starting point and are NOT valid until re-derived against the real
-//   second pair and its own resistor network.
+//   Chain, per sensor: ADC volts x 5 (DFR0051 divider) = sensor output
+//   volts; (output volts - that sensor's own zero) x 30 A/V = amps. The
+//   zero is re-measured per sensor on every tare. ONE scale
+//   (current2_scale) serves all three: they are the same model, and
+//   separate per-sensor scales would add calibration fields the
+//   dashboard doesn't know about yet.
+//   Resolution: one ADC count = 125 uV x 5 x 30 = 0.01875 A.
+//   The DHR limits its output to <14 V, so a divider can't present more
+//   than 2.8 V to the ADS1115.
+//
+//   HOW IT IS READ: a dedicated task (ads2_task) cycles A0, A1, A2, A3 and
+//   only does the I2C. measurement_task picks up each new sample, then
+//   does the tare accumulation, despike and smoothing itself. That keeps
+//   three extra ~10 ms conversion waits out of the 50 ms telemetry loop,
+//   and keeps every tare accumulator owned by measurement_task. Each
+//   channel is refreshed about every 45 ms (four ~11 ms conversions).
+//
+//   NOTE (datasheet): the DHR C10 is a TRUE-RMS transducer with a ~150 ms
+//   response. On a pulsating ESC bus current it reports the RMS of the
+//   ripple, which sits above the mean DC current that a Hall DC sensor
+//   (HAS-600S) reports. A gap between current_a and current_a2 under
+//   load is expected; it is not a fault.
 // ================================================================
-#define SENSOR2_ENABLED             0    // 1 once sensor pair #2 is wired to A2/A3
+#define SENSOR2_ENABLED             1    // 0 compiles everything on ADS1115 #2 out (DHR currents + A3 voltage)
 
-#define CURRENT2_ZERO_OFFSET_V  0.104076f  // Boot-time seed; re-measured on every tare, like sensor 1
-#define CURRENT2_SCALE            160.02f  // 3 - input // PLACEHOLDER — re-derive against the real sensor #2
-#define VOLTAGE2_ZERO_OFFSET_V      0.0f
-#define VOLTAGE2_SCALE             62.51f  // 4 - input // PLACEHOLDER — re-derive against the real sensor #2
-#define NETWORK2_GAIN              2.925f  // PLACEHOLDER — only valid if pair #2 uses an identical network
-#define NETWORK2_OFFSET            4.853f  // PLACEHOLDER — as above
+#define I2C2_MASTER_SCL_IO         42
+#define I2C2_MASTER_SDA_IO         41
+#define I2C2_MASTER_NUM    I2C_NUM_1
+#define DHR_COUNT                   3    // Current sensors on ADS1115 #2: A0, A1, A2
+#define ADS2_CH_COUNT               4    // Everything ads2_task reads: A0, A1, A2 and the A3 voltage
+#define ADS2_VOLT_IDX               3    // Slot of the A3 voltage sample in the s_ads2_* arrays
+
+#define CURRENT2_ZERO_OFFSET_V    0.0f   // Boot-time seed for every DHR; re-measured on every tare
+#define CURRENT2_SCALE            30.0f  // 3 - input: amps per sensor-output volt (300 A / 10 V), shared by all three
+// ── Bus voltage on A3: LV25-P through the 100k / 68k / 330k network ──
+//   Values from the standalone voltage calibration program. That program fed
+//   the ADS1115 pin straight into the maths, so there is NO network gain
+//   here: bus volts = (ADC volts - zero) * scale - offset.
+//   Same filtering as every other channel: MAD despike, then the EMA
+//   (EMA_ALPHA_VOLTAGE), then published as voltage_v2.
+//   The zero is a FIXED constant and is deliberately NOT re-measured on "T"
+//   or at boot: the bus is live then, and zeroing against it would make the
+//   voltage read 0 V. To re-derive it, disconnect the bus, read the A3 value
+//   from the [ADS2 VOLT DEBUG] line, and put it in VOLTAGE2_ZERO_OFFSET_V.
+#define VOLTAGE2_ZERO_OFFSET_V   1.750f  // ADC volts at the A3 pin with 0 V on the bus; replace with the value your calibration run printed if it differed
+#define VOLTAGE2_SCALE         349.70f   // 4 - input: bus volts per ADC volt (runtime-editable as voltage2_scale)
+#define VOLTAGE2_OFFSET_V        0.30f   // Residual +0.3 V seen after that calibration, in BUS volts. Subtracted BEFORE the despike/EMA, so the filtered value is already corrected
+#define NETWORK2_GAIN             5.0f   // DFR0051: 5:1 divider
+#define NETWORK2_OFFSET           0.0f   // No offset network on these inputs
 
 // ================================================================
 // DESPIKE FILTER — rejects single-sample transients (ESC switching
@@ -192,17 +242,18 @@ static volatile int current_throttle_us = THR_MIN;
 static float ema_current_amps = 0.0f;
 static float ema_bus_voltage  = 0.0f;
 static bool  ema_initialized   = false;           // Seeds the EMA rather than ramping it up from zero
-// LIVE zero point (sensor_out_a0 volts at a true 0 A), re-measured on
-// every tare — see tare_finish() and, at boot, ads1115_zero_calibrate_current().
+// LIVE zero point (current channel's sensor_out volts at a true 0 A),
+// re-measured on every tare — see tare_finish() and, at boot,
+// ads1115_zero_calibrate_current().
 static float s_current_zero_offset_v = CURRENT_ZERO_OFFSET_V;
 
-// Sensor pair #2. These stay at exactly 0.0f while SENSOR2_ENABLED is
-// 0 — nothing writes them, so the frame reports a clean 0.00 rather
-// than a floating-pin reading.
-static float ema_current2_amps = 0.0f;
-static float ema_bus_voltage2  = 0.0f;
-static bool  ema2_initialized  = false;
-static float s_current2_zero_offset_v = CURRENT2_ZERO_OFFSET_V;
+// DHR current sensors on ADS1115 #2 (index 0..2 = A0..A2 = current_a2..a4).
+// These stay at exactly 0.0f while SENSOR2_ENABLED is 0, or while the chip
+// never came up: nothing writes them, so the frame reports a clean 0.00
+// rather than a floating-pin reading.
+static float s_dhr_ema[DHR_COUNT]      = { 0.0f, 0.0f, 0.0f };
+static bool  s_dhr_init[DHR_COUNT]     = { false, false, false };
+static float s_dhr_zero_v[DHR_COUNT]   = { CURRENT2_ZERO_OFFSET_V, CURRENT2_ZERO_OFFSET_V, CURRENT2_ZERO_OFFSET_V };
 
 // Rolling despike history, one per channel
 static float s_current_hist[DESPIKE_WINDOW];
@@ -211,12 +262,15 @@ static int   s_current_hist_idx = 0;
 static float s_voltage_hist[DESPIKE_WINDOW];
 static int   s_voltage_hist_n   = 0;
 static int   s_voltage_hist_idx = 0;
-static float s_current2_hist[DESPIKE_WINDOW];
-static int   s_current2_hist_n   = 0;
-static int   s_current2_hist_idx = 0;
-static float s_voltage2_hist[DESPIKE_WINDOW];
-static int   s_voltage2_hist_n   = 0;
-static int   s_voltage2_hist_idx = 0;
+static float s_dhr_hist[DHR_COUNT][DESPIKE_WINDOW];
+static int   s_dhr_hist_n[DHR_COUNT]   = { 0, 0, 0 };
+static int   s_dhr_hist_idx[DHR_COUNT] = { 0, 0, 0 };
+// Bus voltage on ADS1115 #2 A3 (published as voltage_v2). Exactly 0.0f until the first sample.
+static float s_v2_hist[DESPIKE_WINDOW];
+static int   s_v2_hist_n   = 0;
+static int   s_v2_hist_idx = 0;
+static float s_v2_ema      = 0.0f;
+static bool  s_v2_init     = false;
 
 // The window is tiny (≤5), not worth qsort's overhead
 static void despike_isort(float *a, int n) {
@@ -254,14 +308,33 @@ static bool despike_check(float *hist, int *hist_n, int *hist_idx, float sample,
 
 // Raw ADS1115 chain, captured every read and printed periodically (the
 // [ADS DEBUG] log in measurement_task) so a proper 2-point voltage
-// recalibration can be done from real numbers.
+// recalibration can be done from real numbers. Indexed by ADS PIN:
+// a0 = A0 (voltage sensor), a1 = A1 (current sensor).
 static int16_t s_dbg_raw_a0 = 0, s_dbg_raw_a1 = 0;
 static float   s_dbg_node_v_a0 = 0, s_dbg_sensor_out_a0 = 0;
 static float   s_dbg_node_v_a1 = 0, s_dbg_sensor_out_a1 = 0;
+// Same for the DHR current sensors (ADS1115 #2, A0..A2)
+static int16_t s_dbg_raw_dhr[DHR_COUNT]        = { 0, 0, 0 };
+static float   s_dbg_sensor_out_dhr[DHR_COUNT] = { 0, 0, 0 };
+static int16_t s_dbg_raw_v2 = 0;                       // A3 voltage
+static float   s_dbg_node_v_v2 = 0;
 
 // Set up once in i2c_master_init(), used by every read afterwards
 static i2c_master_bus_handle_t s_i2c_bus   = NULL;
 static i2c_master_dev_handle_t s_ads1115_dev = NULL;  // Bound to ADS1115_ADDR on that bus
+// Second ADS1115 (current sensor #2): its own bus, so the shared 0x48 address is fine.
+// s_ads2_ready is a RUNTIME flag: if the chip doesn't answer at boot, current_a2 publishes 0.00
+// and a tare doesn't wait for samples that can never arrive.
+static i2c_master_bus_handle_t s_i2c_bus2    = NULL;
+static i2c_master_dev_handle_t s_ads1115_dev2 = NULL;
+static bool                    s_ads2_ready   = false;
+// Hand-off from ads2_task (writer) to measurement_task (reader). One aligned
+// 16/32-bit store is atomic on the ESP32; seq changing means "new sample".
+static const uint8_t           DHR_MUX[DHR_COUNT]      = { 4, 5, 6 };        // ADS1115 single-ended MUX codes: A0, A1, A2 (the DHR currents)
+static const uint8_t           ADS2_MUX[ADS2_CH_COUNT] = { 4, 5, 6, 7 };     // Everything ads2_task reads; slot 3 (A3) is the voltage
+static volatile int16_t        s_ads2_raw[ADS2_CH_COUNT]  = { 0, 0, 0, 0 };
+static volatile uint32_t       s_ads2_seq[ADS2_CH_COUNT]  = { 0, 0, 0, 0 };
+static uint32_t                s_ads2_seen[ADS2_CH_COUNT] = { 0, 0, 0, 0 };  // measurement_task only
 
 // ── Beam cell pin map (torque) ───────────────────────────────────
 #define S1_DT   4                        // S1 top
@@ -276,7 +349,7 @@ static i2c_master_dev_handle_t s_ads1115_dev = NULL;  // Bound to ADS1115_ADDR o
 // ── S-type load cell (thrust) ────────────────────────────────────
 // Uses the struct-based hx711_t driver — both hx711.h AND hx711.c must
 // be in the build (the component's CMakeLists SRCS), not just the header.
-#define THRUST_SCALE_DEFAULT 18178.5f    // Seeds the runtime table; the live value is thrust_cell.scale
+#define THRUST_SCALE_DEFAULT 21924.0f    // Seeds the runtime table; the live value is thrust_cell.scale
 
 static hx711_t thrust_cell = {
     .dout   = GPIO_NUM_36,
@@ -352,8 +425,8 @@ static hx711_t thrust_cell = {
 typedef struct {
     float current_scale;                 // "1 - input"  — HAS-600S #1, amps per volt
     float voltage_scale;                 // "2 - input"  — LV25-P #1, volts per volt
-    float current2_scale;                // "3 - input"  — pair #2, placeholder until wired
-    float voltage2_scale;                // "4 - input"  — pair #2, placeholder until wired
+    float current2_scale;                // "3 - input"  — the three DHR current sensors (ADS1115 #2 A0..A2), shared
+    float voltage2_scale;                // "4 - input"  — LV25-P bus voltage (ADS1115 #2 A3), bus volts per ADC volt
     float cal_kg[4];                     // "6..9 - input"   — counts/kg, S1..S4
     float tq_cw[4];                      // "9..12 - input"  — torque weights, CW, K1..K4
     float tq_ccw[4];                     // "13..16 - input" — torque weights, CCW, K1..K4
@@ -675,10 +748,10 @@ typedef struct {
 static const char *const TARE_CELL_KEYS[TARE_CELLS] = { "s1", "s2", "s3", "s4", "thrust" };
 
 static tare_acc_t    s_tare_acc[TARE_CELLS];
-static double        s_tare_cur_sum  = 0.0;   // sensor_out_a0 volts, for the current zero
+static double        s_tare_cur_sum  = 0.0;   // Current channel's sensor_out volts, for the current zero
 static int           s_tare_cur_n    = 0;
-static double        s_tare_cur2_sum = 0.0;   // Pair #2; only fed while SENSOR2_ENABLED
-static int           s_tare_cur2_n   = 0;
+static double        s_tare_dhr_sum[DHR_COUNT] = { 0.0, 0.0, 0.0 };   // DHR current zeros; only fed while SENSOR2_ENABLED
+static int           s_tare_dhr_n[DHR_COUNT]   = { 0, 0, 0 };
 static bool          s_tare_active   = false;
 static bool          s_tare_with_current = false;
 static int64_t       s_tare_started_us = 0;
@@ -687,7 +760,7 @@ static volatile bool s_tare_requested = false; // Raised by command_task, consum
 static void tare_begin(bool with_current) {
     memset(s_tare_acc, 0, sizeof(s_tare_acc));
     s_tare_cur_sum  = 0.0; s_tare_cur_n  = 0;
-    s_tare_cur2_sum = 0.0; s_tare_cur2_n = 0;
+    for (int i = 0; i < DHR_COUNT; i++) { s_tare_dhr_sum[i] = 0.0; s_tare_dhr_n[i] = 0; }
     s_tare_with_current = with_current;
     s_tare_started_us   = esp_timer_get_time();
     s_tare_active       = true;
@@ -710,8 +783,14 @@ static void tare_add_current(int pair, float sensor_out_v) {
     if (!s_tare_active || !s_tare_with_current) return;
     if (pair == 1 && s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) {
         s_tare_cur_sum += sensor_out_v; s_tare_cur_n++;
-    } else if (pair == 2 && s_tare_cur2_n < CURRENT_ZERO_CAL_SAMPLES) {
-        s_tare_cur2_sum += sensor_out_v; s_tare_cur2_n++;
+    }
+}
+
+// DHR sensor `idx` (0..DHR_COUNT-1), fed from dhr_update() in measurement_task.
+static void tare_add_dhr(int idx, float sensor_out_v) {
+    if (!s_tare_active || !s_tare_with_current) return;
+    if (s_tare_dhr_n[idx] < CURRENT_ZERO_CAL_SAMPLES) {
+        s_tare_dhr_sum[idx] += sensor_out_v; s_tare_dhr_n[idx]++;
     }
 }
 
@@ -721,7 +800,9 @@ static bool tare_complete(void) {
     if (s_tare_with_current) {
         if (s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) return false;
 #if SENSOR2_ENABLED
-        if (s_tare_cur2_n < CURRENT_ZERO_CAL_SAMPLES) return false;
+        if (s_ads2_ready)
+            for (int i = 0; i < DHR_COUNT; i++)
+                if (s_tare_dhr_n[i] < CURRENT_ZERO_CAL_SAMPLES) return false;
 #endif
     }
     return true;
@@ -772,7 +853,9 @@ static void tare_finish(bool emit_event) {
         }
     }
 
-    bool current_ok = true;
+    bool current_ok  = true;
+    bool dhr_ok[DHR_COUNT] = { true, true, true };
+    bool dhr_all_ok  = true;
     if (s_tare_with_current) {
         if (s_tare_cur_n > 0) {
             s_current_zero_offset_v = (float)(s_tare_cur_sum / s_tare_cur_n);
@@ -783,22 +866,29 @@ static void tare_finish(bool emit_event) {
             current_ok = false;
         }
 #if SENSOR2_ENABLED
-        if (s_tare_cur2_n > 0) {
-            s_current2_zero_offset_v = (float)(s_tare_cur2_sum / s_tare_cur2_n);
-            ema_current2_amps   = 0.0f;
-            s_current2_hist_n   = 0;
-            s_current2_hist_idx = 0;
-        } else {
-            current_ok = false;
+        // If ADS1115 #2 never came up there is nothing to zero, and that is not a tare failure.
+        if (s_ads2_ready) {
+            for (int i = 0; i < DHR_COUNT; i++) {
+                if (s_tare_dhr_n[i] > 0) {
+                    s_dhr_zero_v[i]    = (float)(s_tare_dhr_sum[i] / s_tare_dhr_n[i]);
+                    s_dhr_ema[i]       = 0.0f;       // Snapped, not decayed toward zero over several EMA cycles
+                    s_dhr_hist_n[i]    = 0;          // History is in amps against the OLD zero
+                    s_dhr_hist_idx[i]  = 0;
+                } else {
+                    dhr_ok[i]  = false;
+                    dhr_all_ok = false;
+                }
+            }
         }
 #endif
     }
 
-    ESP_LOGI(TAG, "Tare %s in %lld ms: S1=%ld S2=%ld S3=%ld S4=%ld thrust=%ld (n=%d/%d/%d/%d/%d) current_zero=%.5f V",
-             all_ok && current_ok ? "done" : "PARTIAL", (long long)elapsed_ms,
+    ESP_LOGI(TAG, "Tare %s in %lld ms: S1=%ld S2=%ld S3=%ld S4=%ld thrust=%ld (n=%d/%d/%d/%d/%d) current_zero=%.5f V dhr_zero=%.5f/%.5f/%.5f V",
+             all_ok && current_ok && dhr_all_ok ? "done" : "PARTIAL", (long long)elapsed_ms,
              CH[0].offset, CH[1].offset, CH[2].offset, CH[3].offset, thrust_cell.offset,
              s_tare_acc[0].n, s_tare_acc[1].n, s_tare_acc[2].n, s_tare_acc[3].n, s_tare_acc[4].n,
-             (double)s_current_zero_offset_v);
+             (double)s_current_zero_offset_v,
+             (double)s_dhr_zero_v[0], (double)s_dhr_zero_v[1], (double)s_dhr_zero_v[2]);
 
     if (!emit_event) return;
 
@@ -809,7 +899,7 @@ static void tare_finish(bool emit_event) {
         n += snprintf(body + n, sizeof(body) - n, "%s\"%s\":{\"n\":%d,\"sd_kg\":%.5f}",
                       i ? "," : "", TARE_CELL_KEYS[i], s_tare_acc[i].n, (double)sd_kg[i]);
     }
-    char failed[64];
+    char failed[96];
     int  f = 0;
     failed[0] = '\0';
     for (int i = 0; i < TARE_CELLS && f < (int)sizeof(failed); i++) {
@@ -818,10 +908,14 @@ static void tare_finish(bool emit_event) {
     }
     if (s_tare_with_current && !current_ok && f < (int)sizeof(failed))
         f += snprintf(failed + f, sizeof(failed) - f, "%s\"current\"", f ? "," : "");
+    for (int i = 0; i < DHR_COUNT; i++) {
+        if (s_tare_with_current && !dhr_ok[i] && f < (int)sizeof(failed))
+            f += snprintf(failed + f, sizeof(failed) - f, "%s\"current%d\"", f ? "," : "", i + 2);
+    }
 
     if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
         printf("{\"event\":\"TARE_DONE\",\"ok\":%s,\"ms\":%lld,\"samples\":%d,\"cells\":{%s},\"failed\":[%s]}\n",
-               all_ok && current_ok ? "true" : "false", (long long)elapsed_ms, TARE_SAMPLES, body, failed);
+               all_ok && current_ok && dhr_all_ok ? "true" : "false", (long long)elapsed_ms, TARE_SAMPLES, body, failed);
         xSemaphoreGive(s_io_mutex);
     }
 }
@@ -897,36 +991,125 @@ static float read_thrust_kg(void) {
 }
 
 // ================================================================
-// RPM SENSOR — IR optical slot sensor on GPIO1, interrupt-driven.
+// RPM SENSOR — IR optical sensor on GPIO1, interrupt-driven.
 //   RPM comes from the PERIOD between consecutive pulses.
+//   Works for any motor/battery: a glitch is rejected if it arrives
+//   sooner than RPM_WINDOW_PCT of the recent period (so the window is
+//   ~19 ms at 2000 RPM and ~9 ms at 4000 RPM), never by a fixed time.
+//   A real speed jump is recognised by three equal short gaps in a row.
+//   The ISR is fully IRAM-resident and takes rpm_mux, so rpm_read() always
+//   sees a consistent snapshot.
 // ================================================================
-static volatile uint32_t rpm_pulse_total = 0;
-static volatile int64_t  rpm_last_pulse_us = 0;
-static volatile int64_t  rpm_last_period_us = 0;
-static volatile int64_t  rpm_min_gap_us = -1;
-static float               latest_rpm = 0.0f;
+// ── RPM tuning ───────────────────────────────────────────────────
+// Nothing below is tied to one motor, prop or battery. The only
+// "speed" number is RPM_MAX_VALID, and it only sets an absolute floor on
+// the gap between two edges; the real rejection window follows the speed.
+#define RPM_MAX_VALID         8000   // Fastest RPM you will ever want to read (sets the hard floor)
+#define RPM_WINDOW_PCT          75   // Reject an edge sooner than this % of the recent period...
+#define RPM_RELOCK_EDGES         3   // ...unless this many short gaps in a row agree with each other
+#define RPM_RELOCK_TOL_PCT      25   //    (that is a genuine speed jump, not a glitch)
+#define RPM_STALL_TIMEOUT_MS  1500   // Minimum no-pulse time before reporting 0; stretched at very low speed
+#define RPM_EMA_ALPHA         0.2f
+#define RPM_MIN_GAP_US   (60000000U / ((uint32_t)RPM_MAX_VALID * SLOTS_PER_REV))
 
-#define RPM_DEBOUNCE_US   15000
-#define RPM_STALL_TIMEOUT_MS   1500
-#define RPM_EMA_ALPHA   0.2f
-
+// All state below is touched by the ISR and by rpm_read(), only inside
+// rpm_mux. Timestamps are 32-bit microseconds (wraps every 71 min;
+// unsigned subtraction stays correct across the wrap), so there is no
+// torn 64-bit read on the 32-bit CPU.
+static portMUX_TYPE rpm_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t rpm_ring[3];                 // Last three ACCEPTED periods, µs
+static int      rpm_ring_n = 0, rpm_ring_idx = 0;
+static uint32_t rpm_last_pulse_us = 0;       // Last accepted pulse
+static bool     rpm_have_pulse = false;
+static uint32_t rpm_last_edge_us = 0;        // Last edge of ANY kind (accepted or not)
+static bool     rpm_have_edge = false;
+static uint32_t rpm_reg_gap_us = 0;          // Re-lock tracking: spacing of the last short edge
+static int      rpm_reg_n = 0;               // ...and how many short edges in a row had that same spacing
+static volatile uint32_t rpm_edges_total = 0, rpm_accepted_total = 0,
+                         rpm_rejected_total = 0, rpm_relocks_total = 0;   // Diagnostics only
+static float latest_rpm = 0.0f;
 static float ema_rpm = 0.0f;
 static bool  rpm_ema_initialized = false;
 
+// Median of the accepted periods: one missed or doubled pulse can't move
+// it. Call with rpm_mux held. Must stay in IRAM (the ISR calls it).
+static uint32_t IRAM_ATTR rpm_ref_period(void) {
+    if (rpm_ring_n == 0) return 0;
+    uint32_t latest = rpm_ring[(rpm_ring_idx + 2) % 3];
+    if (rpm_ring_n < 3) return latest;
+    uint32_t a = rpm_ring[0], b = rpm_ring[1], c = rpm_ring[2];
+    uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+    uint32_t m  = c < hi ? c : hi;
+    return m > lo ? m : lo;
+}
+
+// Smallest accepted period (call with rpm_mux held). The rejection window
+// is built from this rather than the median: a run of missed pulses only
+// makes periods LONGER, and must never widen the window until it throws
+// away real pulses (which would lock the reading at half speed).
+static uint32_t IRAM_ATTR rpm_min_period(void) {
+    uint32_t m = 0;
+    for (int i = 0; i < rpm_ring_n; i++) if (m == 0 || rpm_ring[i] < m) m = rpm_ring[i];
+    return m;
+}
+
 static void IRAM_ATTR rpm_isr_handler(void *arg) {
-    int64_t now = esp_timer_get_time();
-    int64_t gap = now - rpm_last_pulse_us;
-    if (rpm_last_pulse_us != 0 && gap < RPM_DEBOUNCE_US) {
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&rpm_mux);
+    rpm_edges_total++;
+
+    uint32_t edge_gap = now - rpm_last_edge_us;      // Spacing to the previous edge of ANY kind
+    bool     edge_ok  = rpm_have_edge;
+    rpm_last_edge_us = now;
+    rpm_have_edge    = true;
+
+    if (!rpm_have_pulse) {                           // First edge since boot or a stall: baseline only
+        rpm_have_pulse    = true;
+        rpm_last_pulse_us = now;
+        rpm_reg_n         = 0;
+        portEXIT_CRITICAL_ISR(&rpm_mux);
         return;
     }
-    if (rpm_last_pulse_us != 0) {
-        rpm_last_period_us = gap;
-        if (rpm_min_gap_us < 0 || gap < rpm_min_gap_us) {
-            rpm_min_gap_us = gap;
-        }
+
+    uint32_t gap    = now - rpm_last_pulse_us;       // Spacing to the last ACCEPTED pulse
+    uint32_t ref    = rpm_min_period();
+    uint32_t window = RPM_MIN_GAP_US;
+    if (ref) {
+        uint32_t w = (ref / 100U) * RPM_WINDOW_PCT;  // Follows the speed
+        if (w > window) window = w;
     }
+
+    // Re-lock detector, fed by EVERY edge. Real rotation is regular; a
+    // glitch is not. If the last RPM_RELOCK_EDGES edge-to-edge gaps were all
+    // shorter than the window yet equal to each other, the pulses we have
+    // been calling "too soon" are the real ones, and the speed has changed
+    // (or we locked onto a multiple of it). Follow it.
+    if (edge_ok && edge_gap >= RPM_MIN_GAP_US && edge_gap < window) {
+        uint32_t d = edge_gap > rpm_reg_gap_us ? edge_gap - rpm_reg_gap_us : rpm_reg_gap_us - edge_gap;
+        if (rpm_reg_n > 0 && d <= (rpm_reg_gap_us / 100U) * RPM_RELOCK_TOL_PCT) rpm_reg_n++;
+        else rpm_reg_n = 1;
+        rpm_reg_gap_us = edge_gap;
+    } else {
+        rpm_reg_n = 0;
+    }
+
+    if (rpm_reg_n >= RPM_RELOCK_EDGES) {
+        gap = edge_gap;
+        rpm_ring_n = 0; rpm_ring_idx = 0;            // Old periods describe the old speed
+        rpm_reg_n = 0;
+        rpm_relocks_total++;
+    } else if (gap < window) {
+        rpm_rejected_total++;                        // Too soon after the last accepted pulse
+        portEXIT_CRITICAL_ISR(&rpm_mux);
+        return;
+    }
+
+    rpm_ring[rpm_ring_idx] = gap;
+    rpm_ring_idx = (rpm_ring_idx + 1) % 3;
+    if (rpm_ring_n < 3) rpm_ring_n++;
     rpm_last_pulse_us = now;
-    rpm_pulse_total++;
+    rpm_accepted_total++;
+    portEXIT_CRITICAL_ISR(&rpm_mux);
 }
 
 static void rpm_sensor_init(void) {
@@ -945,19 +1128,32 @@ static void rpm_sensor_init(void) {
 }
 
 static float rpm_read(float *out_raw) {
-    int64_t now   = esp_timer_get_time();
-    int64_t period = rpm_last_period_us;
-    int64_t last   = rpm_last_pulse_us;
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    bool     have_pulse;
+    int      n;
+    uint32_t last, period;
+    portENTER_CRITICAL(&rpm_mux);
+    have_pulse = rpm_have_pulse;
+    n          = rpm_ring_n;
+    last       = rpm_last_pulse_us;
+    period     = rpm_ref_period();
+    portEXIT_CRITICAL(&rpm_mux);
 
-    if (period <= 0 || last == 0) {
-        if (out_raw) *out_raw = 0.0f;
-        latest_rpm = 0.0f;
-        ema_rpm = 0.0f;
-        rpm_ema_initialized = false;
-        return latest_rpm;
+    uint32_t since = now - last;
+
+    // Stalled: nothing for a while. The limit stretches at very low
+    // speed so a slow, steady rotation isn't called a stall.
+    uint64_t stall_us = (uint64_t)RPM_STALL_TIMEOUT_MS * 1000U;
+    if (period > 0 && ((uint64_t)period * 5 / 2) > stall_us) stall_us = (uint64_t)period * 5 / 2;
+    if (have_pulse && since > stall_us) {
+        portENTER_CRITICAL(&rpm_mux);
+        rpm_have_pulse = false; rpm_have_edge = false;
+        rpm_ring_n = 0; rpm_ring_idx = 0; rpm_reg_n = 0;
+        portEXIT_CRITICAL(&rpm_mux);
+        have_pulse = false;
     }
 
-    if ((now - last) > (int64_t)RPM_STALL_TIMEOUT_MS * 1000) {
+    if (!have_pulse || n == 0 || period == 0) {
         if (out_raw) *out_raw = 0.0f;
         latest_rpm = 0.0f;
         ema_rpm = 0.0f;
@@ -966,6 +1162,14 @@ static float rpm_read(float *out_raw) {
     }
 
     float raw_rpm = 60000000.0f / ((float)period * SLOTS_PER_REV);
+
+    // Coasting down: once the next pulse is clearly late, the speed can't
+    // be higher than "one revolution per time-since-last-pulse". Without
+    // this the last period would be held, stale, until the stall timeout.
+    if (since > 2 * period) {
+        float ceiling = 60000000.0f / ((float)since * SLOTS_PER_REV);
+        if (ceiling < raw_rpm) raw_rpm = ceiling;
+    }
     if (out_raw) *out_raw = raw_rpm;
 
     ema_rpm = rpm_ema_initialized
@@ -1014,6 +1218,54 @@ static esp_err_t i2c_master_init(void) {
     return ESP_OK;
 }
 
+// Second ADS1115 (current sensor #2) on its own controller, I2C_NUM_1.
+// Not fatal if it fails: the rest of the rig runs, current_a2 reads 0.00.
+// The probe up front turns "wired wrong / not powered" into ONE clear
+// boot message instead of an error on every 50 ms cycle.
+static esp_err_t i2c_master_init_2(void) {
+#if SENSOR2_ENABLED
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port          = I2C2_MASTER_NUM,
+        .sda_io_num        = I2C2_MASTER_SDA_IO,
+        .scl_io_num        = I2C2_MASTER_SCL_IO,
+        .clk_source        = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,         // External pull-ups are still recommended
+    };
+
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &s_i2c_bus2);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C bus 2 init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = i2c_master_probe(s_i2c_bus2, ADS1115_ADDR, 100);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 #2 does not answer at 0x%02X on SDA=GPIO%d SCL=GPIO%d (%s) - check 3.3 V, ADDR->GND, SDA/SCL not swapped, pull-ups",
+                 ADS1115_ADDR, I2C2_MASTER_SDA_IO, I2C2_MASTER_SCL_IO, esp_err_to_name(err));
+        return err;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = ADS1115_ADDR,
+        .scl_speed_hz    = I2C_MASTER_FREQ_HZ,
+    };
+    err = i2c_master_bus_add_device(s_i2c_bus2, &dev_cfg, &s_ads1115_dev2);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ADS1115 #2 add_device failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    s_ads2_ready = true;
+    ESP_LOGI(TAG, "ADS1115 #2 found at 0x%02X on I2C%d (SDA=GPIO%d SCL=GPIO%d)",
+             ADS1115_ADDR, (int)I2C2_MASTER_NUM, I2C2_MASTER_SDA_IO, I2C2_MASTER_SCL_IO);
+    return ESP_OK;
+#else
+    return ESP_OK;
+#endif
+}
+
 // One single-ended channel. MUX codes: 4=A0, 5=A1, 6=A2, 7=A3. True on
 // success with the raw 16-bit result in *out_raw; false on any I2C
 // failure WITHOUT touching *out_raw.
@@ -1023,8 +1275,11 @@ static esp_err_t i2c_master_init(void) {
 // STOP), then a read with a fresh START. That matches the known-working
 // legacy driver's pattern rather than using a repeated START between
 // the last two, which some ADS1115 breakouts handle unreliably.
-static bool ads1115_read_channel(uint8_t mux_channel, int16_t *out_raw) {
-    if (xSemaphoreTake(s_i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+// mtx may be NULL when exactly one task ever uses that bus (ADS1115 #2: ads2_task,
+// or app_main before any task exists).
+static bool ads1115_read_channel_dev(i2c_master_dev_handle_t dev, SemaphoreHandle_t mtx, uint8_t mux_channel, int16_t *out_raw) {
+    if (dev == NULL) return false;
+    if (mtx && xSemaphoreTake(mtx, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(TAG, "ADS1115 ch%d: I2C bus busy (other task mid-transaction), skipping this cycle", mux_channel);
         return false;
     }
@@ -1043,49 +1298,54 @@ static bool ads1115_read_channel(uint8_t mux_channel, int16_t *out_raw) {
         (uint8_t)(config & 0xFF)
     };
 
-    esp_err_t err = i2c_master_transmit(s_ads1115_dev, write_buf, sizeof(write_buf), 100);
+    esp_err_t err = i2c_master_transmit(dev, write_buf, sizeof(write_buf), 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADS1115 ch%d config write failed: %s", mux_channel, esp_err_to_name(err));
-        xSemaphoreGive(s_i2c_mutex);
+        if (mtx) xSemaphoreGive(mtx);
         return false;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));                // Conversion time
 
     uint8_t pointer = 0x00;                       // Conversion register
-    err = i2c_master_transmit(s_ads1115_dev, &pointer, 1, 100);
+    err = i2c_master_transmit(dev, &pointer, 1, 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADS1115 ch%d pointer write failed: %s", mux_channel, esp_err_to_name(err));
-        xSemaphoreGive(s_i2c_mutex);
+        if (mtx) xSemaphoreGive(mtx);
         return false;
     }
 
     uint8_t read_buf[2];
-    err = i2c_master_receive(s_ads1115_dev, read_buf, sizeof(read_buf), 100);
+    err = i2c_master_receive(dev, read_buf, sizeof(read_buf), 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ADS1115 ch%d result read failed: %s", mux_channel, esp_err_to_name(err));
-        xSemaphoreGive(s_i2c_mutex);
+        if (mtx) xSemaphoreGive(mtx);
         return false;
     }
 
     *out_raw = (int16_t)((read_buf[0] << 8) | read_buf[1]);
-    xSemaphoreGive(s_i2c_mutex);
+    if (mtx) xSemaphoreGive(mtx);
     return true;
 }
 
-// Reads current (A0) and voltage (A1), applies calibration and EMA
+// ADS1115 #1 (voltage + current). Existing callers are unchanged.
+static bool ads1115_read_channel(uint8_t mux_channel, int16_t *out_raw) {
+    return ads1115_read_channel_dev(s_ads1115_dev, s_i2c_mutex, mux_channel, out_raw);
+}
+
+// Reads current (A1) and voltage (A0), applies calibration and EMA
 // smoothing. If a channel's I2C read fails, that channel's EMA is left
 // holding its last good value rather than corrupted by a garbage sample.
 static void ads1115_read_current_voltage(float *out_current_amps, float *out_voltage) {
-    // ── A0 — current (HAS-600S) ───────────────────────────────────
-    int16_t raw_a0;
-    if (ads1115_read_channel(4, &raw_a0)) {
-        float node_volts_a0   = raw_a0 * ADS_LSB;                      // Counts to volts at the ADC pin
-        float sensor_out_a0   = (node_volts_a0 * NETWORK_GAIN) - NETWORK_OFFSET;  // Undo the resistor network
-        tare_add_current(1, sensor_out_a0);                                    // Collected for the new zero during a tare
-        float current_amps_raw = (sensor_out_a0 - s_current_zero_offset_v) * s_cal.current_scale;  // LIVE, tare-updated zero point
+    // ── A1 — current (HAS-600S) ───────────────────────────────────
+    int16_t raw_a1;
+    if (ads1115_read_channel(ADS_MUX_CURRENT, &raw_a1)) {
+        float node_volts_a1   = raw_a1 * ADS_LSB;                      // Counts to volts at the ADC pin
+        float sensor_out_a1   = (node_volts_a1 * NETWORK_GAIN) - NETWORK_OFFSET;  // Undo the resistor network
+        tare_add_current(1, sensor_out_a1);                                    // Collected for the new zero during a tare
+        float current_amps_raw = (sensor_out_a1 - s_current_zero_offset_v) * s_cal.current_scale;  // LIVE, tare-updated zero point
 
-        s_dbg_raw_a0 = raw_a0; s_dbg_node_v_a0 = node_volts_a0; s_dbg_sensor_out_a0 = sensor_out_a0;  // For the [ADS DEBUG] log
+        s_dbg_raw_a1 = raw_a1; s_dbg_node_v_a1 = node_volts_a1; s_dbg_sensor_out_a1 = sensor_out_a1;  // For the [ADS DEBUG] log
 
         if (despike_check(s_current_hist, &s_current_hist_n, &s_current_hist_idx, current_amps_raw, DESPIKE_MAD_FLOOR_A)) {
             ema_current_amps = ema_initialized
@@ -1095,14 +1355,14 @@ static void ads1115_read_current_voltage(float *out_current_amps, float *out_vol
         if (fabsf(ema_current_amps) < CURRENT_DEADBAND_A) ema_current_amps = 0.0f;
     }
 
-    // ── A1 — voltage (LV25-P) ─────────────────────────────────────
-    int16_t raw_a1;
-    if (ads1115_read_channel(5, &raw_a1)) {
-        float node_volts_a1  = raw_a1 * ADS_LSB;
-        float sensor_out_a1  = (node_volts_a1 * NETWORK_GAIN) - NETWORK_OFFSET;
-        float bus_voltage_raw = (sensor_out_a1 - VOLTAGE_ZERO_OFFSET_V) * s_cal.voltage_scale;
+    // ── A0 — voltage (LV25-P) ─────────────────────────────────────
+    int16_t raw_a0;
+    if (ads1115_read_channel(ADS_MUX_VOLTAGE, &raw_a0)) {
+        float node_volts_a0  = raw_a0 * ADS_LSB;
+        float sensor_out_a0  = (node_volts_a0 * NETWORK_GAIN) - NETWORK_OFFSET;
+        float bus_voltage_raw = (sensor_out_a0 - VOLTAGE_ZERO_OFFSET_V) * s_cal.voltage_scale;
 
-        s_dbg_raw_a1 = raw_a1; s_dbg_node_v_a1 = node_volts_a1; s_dbg_sensor_out_a1 = sensor_out_a1;
+        s_dbg_raw_a0 = raw_a0; s_dbg_node_v_a0 = node_volts_a0; s_dbg_sensor_out_a0 = sensor_out_a0;
 
         if (despike_check(s_voltage_hist, &s_voltage_hist_n, &s_voltage_hist_idx, bus_voltage_raw, DESPIKE_MAD_FLOOR_V)) {
             ema_bus_voltage = ema_initialized
@@ -1117,92 +1377,127 @@ static void ads1115_read_current_voltage(float *out_current_amps, float *out_vol
 }
 
 // ================================================================
-// SECOND SENSOR PAIR — A2 (current #2) / A3 (voltage #2)
+// DHR CURRENT SENSORS — ads2_task (I2C only) + dhr_update (processing)
 //
-//   Same chain as ads1115_read_current_voltage(): network reversal →
-//   calibration → MAD despike → EMA. A separate function rather than a
-//   parameterised one because the two pairs have independent
-//   calibration constants and independent filter state, and folding
-//   them together would make the load-bearing sensor-1 path harder to
-//   read for no real gain.
+//   ads2_task only moves samples: it cycles A0, A1, A2, A3 on ADS1115 #2 and
+//   leaves each raw count and a sequence number for measurement_task.
+//   It is the only user of bus 1 after boot, so it takes no mutex.
 //
-//   With SENSOR2_ENABLED at 0 this compiles down to "write 0.0 and
-//   return" — no I2C traffic, so it costs nothing while the hardware
-//   is absent.
+//   dhr_update() runs inside measurement_task, once per cycle, and for
+//   each channel with a NEW sample does what sensor 1 does: undo the
+//   divider, feed a running tare, subtract the zero, apply the scale,
+//   MAD despike, EMA, deadband. Keeping this half in measurement_task
+//   means the tare accumulators still have exactly one owner.
+//   A channel with no new sample (failed read, task stalled) holds its
+//   last good value.
 // ================================================================
-static void ads1115_read_current_voltage_2(float *out_current2_amps, float *out_voltage2) {
+static void ads2_task(void *arg) {
+    while (1) {
+        bool any_fail = false;
+        for (int i = 0; i < ADS2_CH_COUNT; i++) {
+            int16_t raw;
+            if (ads1115_read_channel_dev(s_ads1115_dev2, NULL, ADS2_MUX[i], &raw)) {
+                s_ads2_raw[i] = raw;
+                s_ads2_seq[i]++;                             // After the raw value, so a reader seeing the new seq sees (at least) that raw
+            } else {
+                any_fail = true;
+            }
+        }
+        if (any_fail) vTaskDelay(pdMS_TO_TICKS(200));        // A broken bus must not flood the log at 30 Hz
+    }
+}
+
+static void dhr_update(float out_amps[DHR_COUNT]) {
 #if SENSOR2_ENABLED
-    int16_t raw_a2;
-    if (ads1115_read_channel(6, &raw_a2)) {
-        float node_volts_a2    = raw_a2 * ADS_LSB;
-        float sensor_out_a2    = (node_volts_a2 * NETWORK2_GAIN) - NETWORK2_OFFSET;
-        tare_add_current(2, sensor_out_a2);
-        float current2_amps_raw = (sensor_out_a2 - s_current2_zero_offset_v) * s_cal.current2_scale;
+    for (int i = 0; i < DHR_COUNT; i++) {
+        uint32_t seq = s_ads2_seq[i];
+        if (s_ads2_ready && seq != s_ads2_seen[i]) {
+            s_ads2_seen[i] = seq;
+            int16_t raw        = s_ads2_raw[i];
+            float node_volts   = raw * ADS_LSB;                                   // Counts to volts at the ADC pin
+            float sensor_out   = (node_volts * NETWORK2_GAIN) - NETWORK2_OFFSET;  // Undo the 5:1 divider
+            tare_add_dhr(i, sensor_out);                                          // Collected for the new zero during a tare
+            float amps_raw     = (sensor_out - s_dhr_zero_v[i]) * s_cal.current2_scale;
 
-        if (despike_check(s_current2_hist, &s_current2_hist_n, &s_current2_hist_idx, current2_amps_raw, DESPIKE_MAD_FLOOR_A)) {
-            ema_current2_amps = ema2_initialized
-                ? (EMA_ALPHA_CURRENT * current2_amps_raw) + ((1.0f - EMA_ALPHA_CURRENT) * ema_current2_amps)
-                : current2_amps_raw;
+            s_dbg_raw_dhr[i] = raw; s_dbg_sensor_out_dhr[i] = sensor_out;         // For the [ADS2 DEBUG] log
+
+            if (despike_check(s_dhr_hist[i], &s_dhr_hist_n[i], &s_dhr_hist_idx[i], amps_raw, DESPIKE_MAD_FLOOR_A)) {
+                s_dhr_ema[i] = s_dhr_init[i]
+                    ? (EMA_ALPHA_CURRENT * amps_raw) + ((1.0f - EMA_ALPHA_CURRENT) * s_dhr_ema[i])
+                    : amps_raw;
+                s_dhr_init[i] = true;                                             // Seeded by the first good sample, not ramped from zero
+            }                                                                     // Rejected: hold the last EMA
+            if (fabsf(s_dhr_ema[i]) < CURRENT_DEADBAND_A) s_dhr_ema[i] = 0.0f;
         }
-        if (fabsf(ema_current2_amps) < CURRENT_DEADBAND_A) ema_current2_amps = 0.0f;
+        out_amps[i] = s_dhr_ema[i];                                               // Exactly 0.0f if the chip never came up
     }
-
-    int16_t raw_a3;
-    if (ads1115_read_channel(7, &raw_a3)) {
-        float node_volts_a3   = raw_a3 * ADS_LSB;
-        float sensor_out_a3   = (node_volts_a3 * NETWORK2_GAIN) - NETWORK2_OFFSET;
-        float bus_voltage2_raw = (sensor_out_a3 - VOLTAGE2_ZERO_OFFSET_V) * s_cal.voltage2_scale;
-
-        if (despike_check(s_voltage2_hist, &s_voltage2_hist_n, &s_voltage2_hist_idx, bus_voltage2_raw, DESPIKE_MAD_FLOOR_V)) {
-            ema_bus_voltage2 = ema2_initialized
-                ? (EMA_ALPHA_VOLTAGE * bus_voltage2_raw) + ((1.0f - EMA_ALPHA_VOLTAGE) * ema_bus_voltage2)
-                : bus_voltage2_raw;
-        }
-    }
-    ema2_initialized = true;
-
-    *out_current2_amps = ema_current2_amps;
-    *out_voltage2      = ema_bus_voltage2;
 #else
-    // Hardware absent — a clean zero rather than whatever a floating
-    // A2/A3 pin happens to be sitting at.
-    (void)s_current2_zero_offset_v;                                 // Silence "set but unused" while disabled
-    *out_current2_amps = 0.0f;
-    *out_voltage2      = 0.0f;
+    for (int i = 0; i < DHR_COUNT; i++) out_amps[i] = 0.0f;
+#endif
+}
+
+// Bus voltage from the LV25-P on ADS1115 #2 A3 -> voltage_v2. Runs inside
+// measurement_task like dhr_update(). Same chain as the main voltage
+// channel: despike, then EMA. The residual offset is removed BEFORE the
+// filters, so the history window and the EMA only ever see corrected values.
+// Nothing here touches the tare: the zero is a fixed constant (see the
+// VOLTAGE2_ZERO_OFFSET_V comment for why).
+static void voltage2_update(float *out_volts) {
+#if SENSOR2_ENABLED
+    uint32_t seq = s_ads2_seq[ADS2_VOLT_IDX];
+    if (s_ads2_ready && seq != s_ads2_seen[ADS2_VOLT_IDX]) {
+        s_ads2_seen[ADS2_VOLT_IDX] = seq;
+        int16_t raw       = s_ads2_raw[ADS2_VOLT_IDX];
+        float node_volts  = raw * ADS_LSB;                                          // Counts to volts at the ADC pin
+        float volts_raw   = (node_volts - VOLTAGE2_ZERO_OFFSET_V) * s_cal.voltage2_scale
+                            - VOLTAGE2_OFFSET_V;                                    // Corrected before any filtering
+
+        s_dbg_raw_v2 = raw; s_dbg_node_v_v2 = node_volts;                           // For the [ADS2 VOLT DEBUG] log
+
+        if (despike_check(s_v2_hist, &s_v2_hist_n, &s_v2_hist_idx, volts_raw, DESPIKE_MAD_FLOOR_V)) {
+            s_v2_ema = s_v2_init
+                ? (EMA_ALPHA_VOLTAGE * volts_raw) + ((1.0f - EMA_ALPHA_VOLTAGE) * s_v2_ema)
+                : volts_raw;                                                        // Seeded, not ramped up from zero
+            s_v2_init = true;
+        }                                                                           // Rejected: hold the last EMA
+    }
+    *out_volts = s_v2_ema;                                                          // Exactly 0.0f if the chip never came up
+#else
+    *out_volts = 0.0f;
 #endif
 }
 
 // ================================================================
 // CURRENT SENSOR ZERO CALIBRATION  (boot only)
-//   A runtime "T" takes the same zero from measurement_task's own A0
-//   reads instead (tare_add_current), so it costs no extra I2C time and
-//   can't contend with the loop for the bus. This blocking version is
-//   for boot, before that loop exists.
+//   A runtime "T" takes the same zero from measurement_task's own
+//   current-channel (A1) reads instead (tare_add_current), so it costs
+//   no extra I2C time and can't contend with the loop for the bus.
+//   This blocking version is for boot, before that loop exists.
 //
-//   Re-measures sensor_out_a0 — the sensor's output after undoing the
-//   resistor network, before the gain — and stores it as the new zero
-//   point. Only valid when the motor is genuinely stationary and
-//   unloaded, the same assumption "T" already makes for the beam and
-//   thrust cells. This is what makes a tare actually zero the current
-//   reading rather than leaving it on a fixed constant that can't
-//   track per-board or thermal drift.
+//   Re-measures the current channel's sensor_out — the sensor's output
+//   after undoing the resistor network, before the gain — and stores it
+//   as the new zero point. Only valid when the motor is genuinely
+//   stationary and unloaded, the same assumption "T" already makes for
+//   the beam and thrust cells. This is what makes a tare actually zero
+//   the current reading rather than leaving it on a fixed constant that
+//   can't track per-board or thermal drift.
 // ================================================================
 static void ads1115_zero_calibrate_current(int samples) {
     float sum = 0.0f;
     int   ok  = 0;
     for (int i = 0; i < samples; i++) {
-        int16_t raw_a0;
-        if (ads1115_read_channel(4, &raw_a0)) {
-            float node_volts_a0 = raw_a0 * ADS_LSB;
-            float sensor_out_a0 = (node_volts_a0 * NETWORK_GAIN) - NETWORK_OFFSET;
-            sum += sensor_out_a0;
+        int16_t raw_a1;
+        if (ads1115_read_channel(ADS_MUX_CURRENT, &raw_a1)) {
+            float node_volts_a1 = raw_a1 * ADS_LSB;
+            float sensor_out_a1 = (node_volts_a1 * NETWORK_GAIN) - NETWORK_OFFSET;
+            sum += sensor_out_a1;
             ok++;
         }
     }
     if (ok > 0) {
         s_current_zero_offset_v = sum / ok;
         ema_current_amps = 0.0f;          // Snapped, not decayed toward zero over several EMA cycles
-        ESP_LOGI(TAG, "Current zero-cal: sensor_out_a0 avg = %.5f V over %d/%d samples (was %.5f V)",
+        ESP_LOGI(TAG, "Current zero-cal: sensor_out_a1 avg = %.5f V over %d/%d samples (was %.5f V)",
                  s_current_zero_offset_v, ok, samples, (double)CURRENT_ZERO_OFFSET_V);
     } else {
         ESP_LOGE(TAG, "Current zero-cal FAILED — no successful ADS1115 reads, keeping previous zero offset (%.5f V)",
@@ -1210,26 +1505,30 @@ static void ads1115_zero_calibrate_current(int samples) {
     }
 
 #if SENSOR2_ENABLED
-    // Compiled out entirely while pair #2 is unpopulated, so a tare
-    // costs no extra I2C time today.
-    float sum2 = 0.0f;
-    int   ok2  = 0;
-    for (int i = 0; i < samples; i++) {
-        int16_t raw_a2;
-        if (ads1115_read_channel(6, &raw_a2)) {
-            float node_volts_a2 = raw_a2 * ADS_LSB;
-            sum2 += (node_volts_a2 * NETWORK2_GAIN) - NETWORK2_OFFSET;
-            ok2++;
+    // DHR current sensors (ADS1115 #2, A0..A2). Skipped if that chip never came up.
+    // ads2_task doesn't exist yet at boot, so the bus is ours and no mutex is needed.
+    if (s_ads2_ready) {
+        for (int c = 0; c < DHR_COUNT; c++) {
+            float sum2 = 0.0f;
+            int   ok2  = 0;
+            for (int i = 0; i < samples; i++) {
+                int16_t raw_d;
+                if (ads1115_read_channel_dev(s_ads1115_dev2, NULL, DHR_MUX[c], &raw_d)) {
+                    float node_volts_d = raw_d * ADS_LSB;
+                    sum2 += (node_volts_d * NETWORK2_GAIN) - NETWORK2_OFFSET;
+                    ok2++;
+                }
+            }
+            if (ok2 > 0) {
+                s_dhr_zero_v[c] = sum2 / ok2;
+                s_dhr_ema[c]    = 0.0f;
+                ESP_LOGI(TAG, "Current#%d (ADS1115 #2 A%d) zero-cal: sensor_out avg = %.5f V over %d/%d samples",
+                         c + 2, c, s_dhr_zero_v[c], ok2, samples);
+            } else {
+                ESP_LOGE(TAG, "Current#%d (ADS1115 #2 A%d) zero-cal FAILED — keeping previous zero offset (%.5f V)",
+                         c + 2, c, s_dhr_zero_v[c]);
+            }
         }
-    }
-    if (ok2 > 0) {
-        s_current2_zero_offset_v = sum2 / ok2;
-        ema_current2_amps = 0.0f;
-        ESP_LOGI(TAG, "Current#2 zero-cal: sensor_out_a2 avg = %.5f V over %d/%d samples",
-                 s_current2_zero_offset_v, ok2, samples);
-    } else {
-        ESP_LOGE(TAG, "Current#2 zero-cal FAILED — keeping previous zero offset (%.5f V)",
-                 s_current2_zero_offset_v);
     }
 #endif
 }
@@ -1626,9 +1925,15 @@ static void run_measurement_setup(void) {
              s_cal.cal_kg[0], s_cal.cal_kg[1], s_cal.cal_kg[2], s_cal.cal_kg[3]);
     ESP_LOGI(TAG, "Sensor scales: current=%.3f voltage=%.3f  current2=%.3f voltage2=%.3f",
              s_cal.current_scale, s_cal.voltage_scale, s_cal.current2_scale, s_cal.voltage2_scale);
-    ESP_LOGI(TAG, "Sensor pair #2 (ADS1115 A2/A3): %s",
-             SENSOR2_ENABLED ? "ENABLED — readings are UNVERIFIED until CURRENT2/VOLTAGE2 constants are re-derived"
-                             : "disabled (hardware absent) — current_a2/voltage_v2 publish 0.00");
+    ESP_LOGI(TAG, "DHR current sensors #2-#4 (LEM DHR 300 C10 x%d, ADS1115 #2 A0-A2 on I2C%d SDA=GPIO%d SCL=GPIO%d): %s, scale=%.3f A/V",
+             DHR_COUNT, (int)I2C2_MASTER_NUM, I2C2_MASTER_SDA_IO, I2C2_MASTER_SCL_IO,
+             !SENSOR2_ENABLED ? "disabled — current_a2..a4 publish 0.00"
+                              : (s_ads2_ready ? "ready" : "NOT FOUND — current_a2..a4 publish 0.00"),
+             (double)s_cal.current2_scale);
+    ESP_LOGI(TAG, "Bus voltage #2 (LV25-P, ADS1115 #2 A3): %s, scale=%.3f V/V, zero=%.4f V, offset=-%.2f V",
+             !SENSOR2_ENABLED ? "disabled — voltage_v2 publishes 0.00"
+                              : (s_ads2_ready ? "ready" : "NOT FOUND — voltage_v2 publishes 0.00"),
+             (double)s_cal.voltage2_scale, (double)VOLTAGE2_ZERO_OFFSET_V, (double)VOLTAGE2_OFFSET_V);
     printf("  Remove all loads. Taring in 5 s...\n\n");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
@@ -1700,8 +2005,10 @@ static void measurement_task(void *arg) {
 
         float current_amps = 0.0f, voltage_v = 0.0f;
         ads1115_read_current_voltage(&current_amps, &voltage_v);
-        float current2_amps = 0.0f, voltage2_v = 0.0f;
-        ads1115_read_current_voltage_2(&current2_amps, &voltage2_v);   // Returns 0.00 while SENSOR2_ENABLED is 0
+        float dhr_amps[DHR_COUNT] = { 0.0f, 0.0f, 0.0f };
+        float voltage2_v = 0.0f;
+        dhr_update(dhr_amps);                                        // current_a2..a4; no I2C wait here, ads2_task does the reads
+        voltage2_update(&voltage2_v);                                // voltage_v2: LV25-P on ADS1115 #2 A3
         int64_t t_ads_done = esp_timer_get_time();
 
         if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
@@ -1711,6 +2018,7 @@ static void measurement_task(void *arg) {
                    "\"rpm\":%.1f,\"rpm_raw\":%.1f,"
                    "\"current_a\":%.2f,\"voltage_v\":%.2f,"
                    "\"current_a2\":%.2f,\"voltage_v2\":%.2f,"
+                   "\"current_a3\":%.2f,\"current_a4\":%.2f,"
                    "\"throttle_us\":%d,\"seq\":%lu}\n",
                    stable ? sv_tau : tau_Nm,
                    thrust_N,
@@ -1721,8 +2029,10 @@ static void measurement_task(void *arg) {
                    rpm_raw,
                    current_amps,
                    voltage_v,
-                   current2_amps,
+                   dhr_amps[0],
                    voltage2_v,
+                   dhr_amps[1],
+                   dhr_amps[2],
                    current_throttle_us,
                    (unsigned long)s_frame_seq);
             xSemaphoreGive(s_io_mutex);
@@ -1745,13 +2055,34 @@ static void measurement_task(void *arg) {
                      (long long)(t_loop_end - t_ads_done));
             // To re-derive VOLTAGE_SCALE (and NETWORK_GAIN/OFFSET if
             // needed) after the panel rebuild: apply a known,
-            // multimeter-verified bus voltage, read sensor_out_a1 from
-            // this line, and true_scale = actual_volts / sensor_out_a1.
+            // multimeter-verified bus voltage, read the A0(V)
+            // sensor_out from this line, and
+            // true_scale = actual_volts / sensor_out.
             // Do it at TWO known voltages, not one, before trusting a
             // new constant.
-            ESP_LOGI(TAG, "[ADS DEBUG] A0(I) raw=%d node_v=%.4f sensor_out=%.4f amps=%.3f | A1(V) raw=%d node_v=%.4f sensor_out=%.4f volts=%.3f",
-                     s_dbg_raw_a0, s_dbg_node_v_a0, s_dbg_sensor_out_a0, current_amps,
-                     s_dbg_raw_a1, s_dbg_node_v_a1, s_dbg_sensor_out_a1, voltage_v);
+            ESP_LOGI(TAG, "[ADS DEBUG] A0(V) raw=%d node_v=%.4f sensor_out=%.4f volts=%.3f | A1(I) raw=%d node_v=%.4f sensor_out=%.4f amps=%.3f",
+                     s_dbg_raw_a0, s_dbg_node_v_a0, s_dbg_sensor_out_a0, voltage_v,
+                     s_dbg_raw_a1, s_dbg_node_v_a1, s_dbg_sensor_out_a1, current_amps);
+#if SENSOR2_ENABLED
+            // DHR sensors: amps = (sensor_out - zero) * scale. At zero current each raw should
+            // sit within a few counts of 0; one count is 0.01875 A.
+            ESP_LOGI(TAG, "[ADS2 DEBUG] ready=%d | A0 raw=%d out=%.4f zero=%.5f amps=%.3f | A1 raw=%d out=%.4f zero=%.5f amps=%.3f | A2 raw=%d out=%.4f zero=%.5f amps=%.3f",
+                     (int)s_ads2_ready,
+                     s_dbg_raw_dhr[0], s_dbg_sensor_out_dhr[0], (double)s_dhr_zero_v[0], dhr_amps[0],
+                     s_dbg_raw_dhr[1], s_dbg_sensor_out_dhr[1], (double)s_dhr_zero_v[1], dhr_amps[1],
+                     s_dbg_raw_dhr[2], s_dbg_sensor_out_dhr[2], (double)s_dhr_zero_v[2], dhr_amps[2]);
+            // Bus voltage on A3. To re-derive VOLTAGE2_ZERO_OFFSET_V: disconnect the bus and
+            // read node_v here. volts = (node_v - zero) * scale - offset.
+            ESP_LOGI(TAG, "[ADS2 VOLT DEBUG] A3 raw=%d node_v=%.4f zero=%.4f scale=%.2f offset=%.2f volts=%.3f",
+                     s_dbg_raw_v2, s_dbg_node_v_v2, (double)VOLTAGE2_ZERO_OFFSET_V,
+                     (double)s_cal.voltage2_scale, (double)VOLTAGE2_OFFSET_V, voltage2_v);
+#endif
+            // Healthy run: rejected stays a small fraction of edges and
+            // relocks stays ~0. A steadily climbing 'rejected' at constant
+            // speed means the sensor is producing extra edges.
+            ESP_LOGI(TAG, "[RPM DEBUG] edges=%lu accepted=%lu rejected=%lu relocks=%lu",
+                     (unsigned long)rpm_edges_total, (unsigned long)rpm_accepted_total,
+                     (unsigned long)rpm_rejected_total, (unsigned long)rpm_relocks_total);
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
@@ -1836,6 +2167,13 @@ void app_main(void) {
         // Continue anyway — torque/thrust/RPM don't need it
     }
 
+#if SENSOR2_ENABLED
+    if (i2c_master_init_2() != ESP_OK) {
+        ESP_LOGE(TAG, "Current sensor #2 unavailable — current_a2 will read 0.00");
+        // Continue anyway: the rest of the rig doesn't depend on it
+    }
+#endif
+
     for (int i = 0; i < 4; i++)
         beam_hx711_init(DT[i], SCK[i]);
 
@@ -1853,6 +2191,12 @@ void app_main(void) {
 
     run_measurement_setup();
 
+#if SENSOR2_ENABLED
+    if (s_ads2_ready) {
+        // Below measurement_task (5): it spends its life in 10 ms conversion waits and must never delay the telemetry loop
+        xTaskCreate(ads2_task,    "ads2_task",  4096, NULL, 4,  NULL);
+    }
+#endif
     xTaskCreate(command_task,     "cmd_task",   4096, NULL, 10, NULL);
     xTaskCreate(measurement_task, "meas_task",  8192, NULL, 5,  NULL);
 #endif
