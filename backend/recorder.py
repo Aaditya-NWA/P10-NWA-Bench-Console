@@ -44,10 +44,16 @@ COLUMNS: list[tuple[str, str]] = [
     ("RPM",           "rpm"),
     ("RPM raw",       "rpm_raw"),
     ("Throttle (µs)", "throttle_us"),
-    ("Current (A)",   "current_a"),
-    ("Voltage (V)",   "voltage_v"),
-    ("Current 2 (A)", "current_a2"),
-    ("Voltage 2 (V)", "voltage_v2"),
+    # DC side: HAS-600S current + LV25-P voltage on ADS1115 #1.
+    ("DC Current (A)",   "current_a"),
+    ("DC Voltage (V)",   "voltage_v"),
+    # AC side: three DHR 300 C10 currents (A0..A2) + LV25-P voltage (A3)
+    # on ADS1115 #2. The telemetry keys are the firmware's and keep their
+    # historical names; only the labels say AC.
+    ("AC Current 1 (A)", "current_a2"),
+    ("AC Current 2 (A)", "current_a3"),
+    ("AC Current 3 (A)", "current_a4"),
+    ("AC Voltage (V)",   "voltage_v2"),
 ]
 
 FLUSH_INTERVAL_S = 1.0

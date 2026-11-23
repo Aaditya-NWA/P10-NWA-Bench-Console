@@ -33,6 +33,18 @@ describe("summarizeTare", () => {
     expect(r.failed).toEqual(["S4"]);
   });
 
+  it("names failed current sensors as DC / AC 1-3, not firmware keys", () => {
+    // Firmware calls the AC sensors current2..current4 after their
+    // telemetry fields; the operator knows them as AC Current 1..3.
+    const r = summarizeTare({
+      event: "TARE_DONE", ok: false, ms: 4001,
+      failed: ["current", "current2", "current3", "current4"],
+      cells: { s1: quiet, s2: quiet, s3: quiet, s4: quiet, thrust: quiet },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failed).toEqual(["DC Current", "AC Current 1", "AC Current 2", "AC Current 3"]);
+  });
+
   it("flags a cell whose zero is less certain than the display dead band", () => {
     // sd 0.05 kg over 20 samples → ±0.011 kg on the zero, past the
     // 0.005 kg beam dead band: someone was leaning on the rig.

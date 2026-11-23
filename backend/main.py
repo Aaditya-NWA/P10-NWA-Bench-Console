@@ -177,10 +177,11 @@ CAL_FIELD_SPEC: list[dict] = [
     {"key": "tq_k2_ccw",      "group": "Torque CCW",  "label": "K2 (S2 weight)",        "unit": "",          "min": -100.0, "max": 100.0},
     {"key": "tq_k3_ccw",      "group": "Torque CCW",  "label": "K3 (S3 weight)",        "unit": "",          "min": -100.0, "max": 100.0},
     {"key": "tq_k4_ccw",      "group": "Torque CCW",  "label": "K4 (S4 weight)",        "unit": "",          "min": -100.0, "max": 100.0},
-    {"key": "current_scale",  "group": "Power sensor 1", "label": "Current scale",      "unit": "A/V",       "min": 0.001,  "max": 1.0e5},
-    {"key": "voltage_scale",  "group": "Power sensor 1", "label": "Voltage scale",      "unit": "V/V",       "min": 0.001,  "max": 1.0e5},
-    {"key": "current2_scale", "group": "Power sensor 2", "label": "Current scale",      "unit": "A/V",       "min": 0.001,  "max": 1.0e5},
-    {"key": "voltage2_scale", "group": "Power sensor 2", "label": "Voltage scale",      "unit": "V/V",       "min": 0.001,  "max": 1.0e5},
+    {"key": "current_scale",  "group": "DC power",    "label": "DC current scale",      "unit": "A/V",       "min": 0.001,  "max": 1.0e5},
+    {"key": "voltage_scale",  "group": "DC power",    "label": "DC voltage scale",      "unit": "V/V",       "min": 0.001,  "max": 1.0e5},
+    # One scale serves all three AC current sensors (same DHR 300 C10 model).
+    {"key": "current2_scale", "group": "AC power",    "label": "AC current scale (1-3)", "unit": "A/V",      "min": 0.001,  "max": 1.0e5},
+    {"key": "voltage2_scale", "group": "AC power",    "label": "AC voltage scale",      "unit": "V/V",       "min": 0.001,  "max": 1.0e5},
 ]
 CAL_KEYS = {f["key"]: f for f in CAL_FIELD_SPEC}
 

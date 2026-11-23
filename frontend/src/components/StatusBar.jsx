@@ -113,11 +113,11 @@ export default function StatusBar({
 
 ${tareResult.detail}`
     : tareResult?.detail
-      ? `Re-zero all four beam cells, the thrust cell and the current sensor (~2 s).
+      ? `Re-zero all four beam cells, the thrust cell and the DC + AC current sensors (~2 s).
 
 Last tare:
 ${tareResult.detail}`
-    : "Re-zero all four beam cells, the thrust cell and the current sensor";
+    : "Re-zero all four beam cells, the thrust cell and the DC + AC current sensors";
 
   const handlePortChange = (e) => {
     const port = e.target.value;

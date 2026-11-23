@@ -24,7 +24,8 @@ def make_frame(i: int = 0, **overrides) -> dict:
         "stable": True, "dir": "CW",
         "rpm": 12450.0 + i, "rpm_raw": 12470.0 + i, "throttle_us": 1300,
         "current_a": 1.85, "voltage_v": 22.1,
-        "current_a2": 0.0, "voltage_v2": 0.0,
+        "current_a2": 12.4, "voltage_v2": 15.2,
+        "current_a3": 12.1, "current_a4": 12.7,
     }
     frame.update(overrides)
     return frame
@@ -59,6 +60,22 @@ def test_csv_contains_a_row_per_frame_with_the_documented_columns(auth_client, d
     assert rows[0]["Thrust (N)"] == "45.6"
     assert rows[0]["Stable"] == "Yes"
     assert rows[0]["Direction"] == "CW"
+
+
+def test_csv_labels_the_power_channels_dc_and_ac(auth_client, data_dir):
+    """current_a/voltage_v are the DC side; current_a2..a4 + voltage_v2 the AC side."""
+    record_frames(auth_client, n=1)
+    auth_client.post("/recording/stop")
+
+    path = next((data_dir / "CSV").glob("*.csv"))
+    row = next(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+
+    assert row["DC Current (A)"] == "1.85"
+    assert row["DC Voltage (V)"] == "22.1"
+    assert row["AC Current 1 (A)"] == "12.4"
+    assert row["AC Current 2 (A)"] == "12.1"
+    assert row["AC Current 3 (A)"] == "12.7"
+    assert row["AC Voltage (V)"] == "15.2"
 
 
 def test_csv_columns_are_the_ones_the_analysis_tab_can_auto_detect(auth_client, data_dir):

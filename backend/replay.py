@@ -30,6 +30,7 @@ from constants import (
     EV_PONG, EV_TARE_DONE, EV_TARE_STARTED, EV_THROTTLE_SET, FILE_ENCODING,
     THR_MAX, THR_MIN,
 )
+from recorder import COLUMNS
 
 ENABLE_ENV = "NWA_BENCH_ALLOW_REPLAY"
 ENV_FALSE_VALUES = ("", "0", "false", "False")
@@ -53,6 +54,12 @@ SIM_MAX_CURRENT_A = 52.0
 SIM_CURRENT_EXPONENT = 2.1
 SIM_PACK_VOLTAGE_V = 24.6
 SIM_PACK_RESISTANCE_OHM = 0.035
+# AC side (motor phases). Phase RMS current tracks the DC current; the
+# per-phase factors give a small, visible imbalance so the three cards
+# aren't identical. Line voltage RMS scales with the ESC's modulation.
+SIM_AC_CURRENT_RATIO = 0.82
+SIM_AC_PHASE_IMBALANCE = (1.00, 0.97, 1.03)
+SIM_AC_VOLTAGE_RATIO = 0.61          # Line-to-line RMS ≈ 0.61 × V_dc at full modulation
 SIM_SETTLED_RPM_ABS = 60.0           # Whichever of these is larger counts as settled
 SIM_SETTLED_RPM_FRAC = 0.01
 SIM_TARE_S = 2.0                     # Matches the firmware: 20 samples per cell at 10 SPS
@@ -84,15 +91,14 @@ def load_frames(path: str) -> list[dict]:
         return frames
 
     if p.suffix.lower() == EXT_CSV:
-        # Map the console's own CSV headers back to telemetry keys.
-        column_to_key = {
-            "Torque (N·m)": "torque", "Thrust (N)": "thrust",
-            "S1 (kg)": "s1", "S2 (kg)": "s2", "S3 (kg)": "s3", "S4 (kg)": "s4",
-            "Stable": "stable", "Direction": "dir",
-            "RPM": "rpm", "RPM raw": "rpm_raw", "Throttle (µs)": "throttle_us",
+        # Map the console's own CSV headers back to telemetry keys. The
+        # current recorder.COLUMNS labels come first; the pre-AC-sensor
+        # labels stay so runs recorded before the rename still replay.
+        column_to_key = {label: key for label, key in COLUMNS if key != "ts"}
+        column_to_key.update({
             "Current (A)": "current_a", "Voltage (V)": "voltage_v",
             "Current 2 (A)": "current_a2", "Voltage 2 (V)": "voltage_v2",
-        }
+        })
         frames = []
         with p.open("r", encoding=CSV_ENCODING, newline="") as fh:
             for row in csv.DictReader(fh):
@@ -166,6 +172,15 @@ class _Simulator:
         voltage = (SIM_PACK_VOLTAGE_V - current * SIM_PACK_RESISTANCE_OHM
                    + random.gauss(0, 0.02))
 
+        motor_frac = self.rpm / SIM_MAX_RPM          # Follows the motor, not the command
+        ac_currents = [
+            max(0.0, current * SIM_AC_CURRENT_RATIO * k * motor_frac ** 0.5
+                + random.gauss(0, 0.1))
+            for k in SIM_AC_PHASE_IMBALANCE
+        ]
+        ac_voltage = max(0.0, voltage * SIM_AC_VOLTAGE_RATIO * motor_frac
+                         + random.gauss(0, 0.05))
+
         settled = abs(target_rpm - self.rpm) < max(
             SIM_SETTLED_RPM_ABS, target_rpm * SIM_SETTLED_RPM_FRAC)
 
@@ -180,8 +195,10 @@ class _Simulator:
             "rpm_raw": round(rpm_raw, 1),
             "current_a": round(max(0.0, current), 2),
             "voltage_v": round(voltage, 2),
-            "current_a2": 0.0,
-            "voltage_v2": 0.0,
+            "current_a2": round(ac_currents[0], 2),
+            "voltage_v2": round(ac_voltage, 2),
+            "current_a3": round(ac_currents[1], 2),
+            "current_a4": round(ac_currents[2], 2),
             "throttle_us": self.throttle_us,
         }
 

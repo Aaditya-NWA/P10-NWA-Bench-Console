@@ -61,7 +61,8 @@ def test_simulated_source_feeds_frames_through_the_real_reader(auth_client, stop
     frame = main.history[-1]
     for key in ("torque", "thrust", "s1", "s2", "s3", "s4", "stable", "dir",
                 "rpm", "rpm_raw", "current_a", "voltage_v",
-                "current_a2", "voltage_v2", "throttle_us", "ts"):
+                "current_a2", "current_a3", "current_a4", "voltage_v2",
+                "throttle_us", "ts"):
         assert key in frame, f"replayed frame is missing {key}"
 
 
@@ -134,7 +135,8 @@ def test_a_recorded_csv_round_trips_back_through_replay(auth_client, data_dir, s
         frame = {"ts": time.time(), "torque": 2.5 + i, "thrust": 50.0 + i,
                  "s1": 0.1, "s2": 0.2, "s3": 0.3, "s4": 0.4, "stable": True, "dir": "CW",
                  "rpm": 9000.0 + i, "rpm_raw": 9010.0 + i, "throttle_us": 1350,
-                 "current_a": 2.0, "voltage_v": 23.0, "current_a2": 0.0, "voltage_v2": 0.0}
+                 "current_a": 2.0, "voltage_v": 23.0, "current_a2": 11.0, "voltage_v2": 14.0,
+                 "current_a3": 11.5, "current_a4": 12.0}
         main.session_recorder.write(frame)
     auth_client.post("/recording/stop")
 
@@ -146,6 +148,39 @@ def test_a_recorded_csv_round_trips_back_through_replay(auth_client, data_dir, s
     assert frames[0]["dir"] == "CW"
     assert frames[0]["stable"] is True
     assert frames[0]["throttle_us"] == 1350.0
+    assert frames[0]["current_a"] == 2.0
+    assert frames[0]["voltage_v"] == 23.0
+    assert (frames[0]["current_a2"], frames[0]["current_a3"], frames[0]["current_a4"]) == (11.0, 11.5, 12.0)
+    assert frames[0]["voltage_v2"] == 14.0
+
+
+def test_a_csv_recorded_before_the_ac_rename_still_replays(tmp_path):
+    """Runs recorded with the old 'Current (A)' / 'Current 2 (A)' headers."""
+    old = tmp_path / "old_run.csv"
+    old.write_text(
+        "Timestamp,Torque (N·m),Thrust (N),RPM,Current (A),Voltage (V),Current 2 (A),Voltage 2 (V)\n"
+        "2026-10-01 10:00:00.000,1.5,40.0,9000,3.2,24.1,0.0,0.0\n",
+        encoding="utf-8-sig")
+
+    frames = replay.load_frames(str(old))
+
+    assert frames[0]["current_a"] == 3.2
+    assert frames[0]["voltage_v"] == 24.1
+    assert frames[0]["current_a2"] == 0.0
+    assert frames[0]["voltage_v2"] == 0.0
+
+
+def test_simulated_ac_channels_follow_the_motor():
+    sim = replay._Simulator()
+    idle = sim.next_frame(0.05)
+    assert idle["current_a2"] < 1.0 and idle["voltage_v2"] < 1.0
+
+    sim.set_throttle(1800)
+    for _ in range(200):
+        frame = sim.next_frame(0.05)
+    for key in ("current_a2", "current_a3", "current_a4"):
+        assert frame[key] > 5.0, key
+    assert frame["voltage_v2"] > 5.0
 
 
 def test_replaying_a_missing_file_is_reported_not_raised(auth_client):

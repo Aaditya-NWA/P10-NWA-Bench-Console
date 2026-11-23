@@ -1,6 +1,13 @@
 import { TARE_ZERO_LIMIT_KG } from "./constants";
 
-const CELL_LABEL = { s1: "S1", s2: "S2", s3: "S3", s4: "S4", thrust: "Thrust", current: "Current" };
+// Firmware keys -> display names. "current" is the DC sensor; the firmware
+// names the AC sensors current2..current4 (after their telemetry fields
+// current_a2..a4), which the dashboard shows as AC Current 1..3.
+const CELL_LABEL = {
+  s1: "S1", s2: "S2", s3: "S3", s4: "S4", thrust: "Thrust",
+  current: "DC Current",
+  current2: "AC Current 1", current3: "AC Current 2", current4: "AC Current 3",
+};
 
 /**
  * Reduce a firmware TARE_DONE line to what the Tare button shows.

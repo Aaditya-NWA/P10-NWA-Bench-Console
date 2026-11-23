@@ -181,13 +181,16 @@ One JSON line per cycle (~20 Hz):
 ```json
 {"torque":10.3412,"thrust":45.231,"s1":1.203,"s2":-0.412,"s3":0.891,"s4":0.034,
  "stable":true,"dir":"CW","rpm":12450.0,"rpm_raw":12470.0,
- "current_a":1.85,"voltage_v":22.1,"current_a2":0.00,"voltage_v2":0.00,
+ "current_a":1.85,"voltage_v":22.1,
+ "current_a2":12.40,"voltage_v2":15.20,"current_a3":12.10,"current_a4":12.70,
  "throttle_us":1300}
 ```
 
 `load` and `f_arm` were removed on 2026-08-03 — the firmware no longer publishes either.
-`current_a2` / `voltage_v2` are the second ADS1115 pair; they read a hard `0.00` until
-that hardware is fitted and `SENSOR2_ENABLED` is turned on.
+`current_a` / `voltage_v` are the **DC** current and voltage (first ADS1115).
+`current_a2`, `current_a3`, `current_a4` and `voltage_v2` are the **AC** side on a second
+ADS1115 — shown as AC Current 1, 2, 3 and AC Voltage. They read a hard `0.00` while that
+ADS1115 is absent or `SENSOR2_ENABLED` is off.
 
 Commands (dashboard → backend → ESP32):
 

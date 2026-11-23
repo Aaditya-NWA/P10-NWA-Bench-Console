@@ -94,13 +94,18 @@ export default function App() {
   const thrust  = latest?.thrust ?? null;           // N from the S-type cell
   const rpm     = latest?.rpm    ?? null;
   const rpmRaw  = latest?.rpm_raw ?? null;          // Before the firmware's smoothing
-  const current = latest?.current_a ?? null;        // ADS1115 A0 (HAS-600S #1)
-  const voltage = latest?.voltage_v ?? null;        // ADS1115 A1 (LV25-P #1)
-  // Sensor pair 2 on ADS1115 A2/A3. The firmware always sends these but
-  // publishes a hard 0.00 until the hardware is fitted and
-  // SENSOR2_ENABLED is on, so they read 0 rather than "—".
-  const current2 = latest?.current_a2 ?? null;
-  const voltage2 = latest?.voltage_v2 ?? null;
+  // DC side, ADS1115 #1: A1 = HAS-600S current, A0 = LV25-P voltage.
+  const dcCurrent = latest?.current_a ?? null;
+  const dcVoltage = latest?.voltage_v ?? null;
+  // AC side, ADS1115 #2: A0..A2 = three DHR 300 C10 currents, A3 = LV25-P
+  // voltage. The wire keys keep the firmware's names (current_a2..a4,
+  // voltage_v2). The firmware publishes a hard 0.00 while that ADS1115 is
+  // absent or SENSOR2_ENABLED is off, so they read 0 rather than "—";
+  // a build that predates current_a3/a4 shows "—" for those two.
+  const acCurrent1 = latest?.current_a2 ?? null;
+  const acCurrent2 = latest?.current_a3 ?? null;
+  const acCurrent3 = latest?.current_a4 ?? null;
+  const acVoltage  = latest?.voltage_v2 ?? null;
   // Left undefined (not defaulted to false) when the frame omits it —
   // the RPM-test-pass firmware doesn't send it, and StatusBar shows a
   // neutral "N/A" badge instead of a "SETTLING" that would never clear.
@@ -302,38 +307,57 @@ export default function App() {
               : "Unfiltered sensor reading and its difference from the filtered value"}
           />
           <MetricCard
-            label="CURRENT"
-            value={current}
+            label="DC CURRENT"
+            value={dcCurrent}
             unit="A"
             accent="var(--accent-thrust)"
             decimals={2}
           />
           <MetricCard
-            label="VOLTAGE"
-            value={voltage}
+            label="DC VOLTAGE"
+            value={dcVoltage}
             unit="V"
             accent="var(--accent-load)"
             decimals={2}
           />
           <MetricCard
-            label="POWER"
-            value={current !== null && voltage !== null ? current * voltage : null}
+            label="DC POWER"
+            value={dcCurrent !== null && dcVoltage !== null ? dcCurrent * dcVoltage : null}
             unit="W"
             accent="var(--accent-torque)"
             decimals={1}
           />
-          {/* Reads 0.00 until that hardware is fitted — see
-              SENSOR2_ENABLED in esp32/main.c */}
+        </div>
+
+        {/* Own row: the AC sensors are a separate ADS1115 and read 0.00
+            until it is fitted — see SENSOR2_ENABLED in esp32/main.c.
+            No AC power card: V × I without the phase angle would be
+            apparent power at best, and easy to misread as real power. */}
+        <div style={styles.metricRow}>
           <MetricCard
-            label="CURRENT 2"
-            value={current2}
+            label="AC CURRENT 1"
+            value={acCurrent1}
             unit="A"
             accent="var(--accent-thrust)"
             decimals={2}
           />
           <MetricCard
-            label="VOLTAGE 2"
-            value={voltage2}
+            label="AC CURRENT 2"
+            value={acCurrent2}
+            unit="A"
+            accent="var(--accent-thrust)"
+            decimals={2}
+          />
+          <MetricCard
+            label="AC CURRENT 3"
+            value={acCurrent3}
+            unit="A"
+            accent="var(--accent-thrust)"
+            decimals={2}
+          />
+          <MetricCard
+            label="AC VOLTAGE"
+            value={acVoltage}
             unit="V"
             accent="var(--accent-load)"
             decimals={2}
