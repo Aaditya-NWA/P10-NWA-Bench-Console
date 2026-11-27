@@ -78,6 +78,57 @@ def test_csv_labels_the_power_channels_dc_and_ac(auth_client, data_dir):
     assert row["AC Voltage (V)"] == "15.2"
 
 
+def _one_row(auth_client, data_dir, **overrides) -> dict:
+    auth_client.post("/recording/start", json={"test_name": "power"})
+    main.session_recorder.write(make_frame(0, **overrides))
+    auth_client.post("/recording/stop")
+    path = next((data_dir / "CSV").glob("*.csv"))
+    return next(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+
+
+def test_csv_adds_electrical_and_mechanical_power_and_efficiency(auth_client, data_dir):
+    # 48 V x 10 A = 480 W in; 2*pi*3000 rpm*1.2 N.m/60 = 376.99 W out; 78.5 %.
+    row = _one_row(auth_client, data_dir, voltage_v=48.0, current_a=10.0, rpm=3000.0, torque=1.2)
+    assert row["Electrical Power (W)"] == "480.0"
+    assert row["Mechanical Power (W)"] == "376.99"
+    assert row["Motor+ESC Efficiency (%)"] == "78.5"
+
+
+def test_mechanical_power_is_positive_for_either_spin_direction(auth_client, data_dir):
+    row = _one_row(auth_client, data_dir, voltage_v=48.0, current_a=10.0, rpm=3000.0, torque=-1.2, dir="CCW")
+    assert row["Mechanical Power (W)"] == "376.99"
+    assert row["Motor+ESC Efficiency (%)"] == "78.5"
+
+
+def test_efficiency_is_blank_at_idle_instead_of_dividing_noise(auth_client, data_dir):
+    row = _one_row(auth_client, data_dir, voltage_v=48.0, current_a=0.0, rpm=0.0, torque=0.0)
+    assert row["Electrical Power (W)"] == "0.0"
+    assert row["Mechanical Power (W)"] == "0.0"
+    assert row["Motor+ESC Efficiency (%)"] == ""
+
+
+def test_power_cells_are_blank_when_a_reading_is_missing(auth_client, data_dir):
+    frame = make_frame(0)
+    del frame["voltage_v"]
+    auth_client.post("/recording/start", json={"test_name": "gap"})
+    main.session_recorder.write(frame)
+    auth_client.post("/recording/stop")
+    path = next((data_dir / "CSV").glob("*.csv"))
+    row = next(csv.DictReader(io.StringIO(path.read_text(encoding="utf-8-sig"))))
+    assert row["Electrical Power (W)"] == ""
+    assert row["Motor+ESC Efficiency (%)"] == ""
+    assert row["Mechanical Power (W)"] != ""
+
+
+def test_replaying_a_recorded_csv_ignores_the_derived_power_columns(auth_client, data_dir):
+    import replay
+    _one_row(auth_client, data_dir, voltage_v=48.0, current_a=10.0, rpm=3000.0, torque=1.2)
+    path = next((data_dir / "CSV").glob("*.csv"))
+    frames = replay.load_frames(str(path))
+    assert frames[0]["voltage_v"] == 48.0
+    assert not set(frames[0]) & recorder.DERIVED_KEYS
+
+
 def test_csv_columns_are_the_ones_the_analysis_tab_can_auto_detect(auth_client, data_dir):
     """A recorded run must be loadable straight back into Tab 2.
 

@@ -8,8 +8,9 @@ import {
 /**
  * LinkHealth — the ESP32 Communication card.
  *
- * Closed by default: a small square in the header showing signal bars in
- * the status colour, so it costs no room until someone wants it. Click
+ * Closed by default: a small chip in the header showing signal bars and
+ * "USB: CONNECTED / WARNING / DISCONNECTED" in the status colour, so the
+ * cable's state is readable at a glance without costing much room. Click
  * it for the card — one status word, the link's vital numbers, and a
  * connection-quality bar — with the deeper diagnostics (waveform,
  * messages, event log) folded under "Details".
@@ -138,6 +139,14 @@ export default function LinkHealth({
   const problems = (health?.issues ?? []).filter((i) => i.level === "warn" || i.level === "error");
   const worst    = problems.find((i) => i.level === "error") ?? problems[0];
 
+  // "USB: …" on the closed chip. Port not open (cable out, or nothing
+  // selected) is DISCONNECTED; with the backend gone the cable's state
+  // simply isn't known from here.
+  const usb =
+    !wsConnected     ? { text: "USB: UNKNOWN",      colour: "var(--text-secondary)" }
+  : !serialConnected ? { text: "USB: DISCONNECTED", colour: "var(--status-offline)" }
+  :                    { text: `USB: ${ss.label}`,  colour: ss.colour };
+
   const subline =
     !wsConnected       ? "The dashboard has lost the backend"
   : !serialConnected   ? "No COM port open"
@@ -149,7 +158,7 @@ export default function LinkHealth({
     <div ref={rootRef} style={styles.root}>
       <button
         type="button"
-        style={{ ...styles.square, borderColor: linkUp ? ss.colour : "var(--bg-border)" }}
+        style={{ ...styles.square, borderColor: wsConnected ? usb.colour : "var(--bg-border)" }}
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
         aria-label="ESP32 communication status"
@@ -160,6 +169,10 @@ export default function LinkHealth({
         <span style={{ animation: status === COMM_STATUS.DISCONNECTED && linkUp ? "pulse 1.2s ease-in-out infinite" : "none", display: "flex" }}>
           <SignalBars lit={bars} colour={ss.colour} />
         </span>
+        {/* The USB/COM link's state in words, always visible: an operator
+            checking the cable shouldn't have to open the card or know
+            what the bar colours mean. */}
+        <span style={{ ...styles.chipText, color: usb.colour }}>{usb.text}</span>
         {worst && status !== COMM_STATUS.DISCONNECTED && (
           <span style={{ ...styles.badge, background: LEVEL_COLOUR[worst.level] }} />
         )}
@@ -360,17 +373,24 @@ const styles = {
   // Same footprint as the unit / settings / theme buttons beside it
   square: {
     position:       "relative",
-    width:          "36px",
     height:         "36px",
     display:        "flex",
     alignItems:     "center",
     justifyContent: "center",
+    gap:            "0.45rem",
     background:     "var(--bg-elevated)",
     border:         "1px solid",
     borderRadius:   "var(--radius-sm)",
     cursor:         "pointer",
     transition:     "var(--transition)",
-    padding:        0,
+    padding:        "0 0.65rem",
+  },
+  chipText: {
+    fontFamily:     "var(--font-ui)",
+    fontSize:       "0.78rem",
+    fontWeight:     700,
+    letterSpacing:  "0.04em",
+    whiteSpace:     "nowrap",
   },
   badge: {
     position:       "absolute",

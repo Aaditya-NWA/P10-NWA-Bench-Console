@@ -268,7 +268,7 @@ def test_simulated_tare_reports_started_then_done_with_per_cell_noise(stop_reade
     conn.write(b"T\n")
 
     assert json.loads(conn.readline())["event"] == "TARE_STARTED"
-    deadline = time.monotonic() + 4
+    deadline = time.monotonic() + 5                     # The tare is 3 s, like the firmware's current window
     done = None
     while time.monotonic() < deadline and done is None:
         line = conn.readline()
@@ -279,3 +279,7 @@ def test_simulated_tare_reports_started_then_done_with_per_cell_noise(stop_reade
     assert done["ok"] is True
     assert set(done["cells"]) == {"s1", "s2", "s3", "s4", "thrust"}
     assert done["failed"] == []
+    # Current zeros: DC + AC 1-3, each with spread and drift; at rest, settled
+    assert set(done["currents"]) == {"current", "current2", "current3", "current4"}
+    assert all({"n", "zero_v", "sd_a", "drift_a"} <= set(c) for c in done["currents"].values())
+    assert done["unsettled"] == []

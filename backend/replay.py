@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import random
 import threading
@@ -30,7 +31,7 @@ from constants import (
     EV_PONG, EV_TARE_DONE, EV_TARE_STARTED, EV_THROTTLE_SET, FILE_ENCODING,
     THR_MAX, THR_MIN,
 )
-from recorder import COLUMNS
+from recorder import COLUMNS, DERIVED_KEYS
 
 ENABLE_ENV = "NWA_BENCH_ALLOW_REPLAY"
 ENV_FALSE_VALUES = ("", "0", "false", "False")
@@ -44,15 +45,20 @@ IDLE_SLEEP_S = 0.25                  # Bounded, so close() stays responsive
 EXHAUSTED_SLEEP_S = 0.2
 
 # ── Simulator model ───────────────────────────────────────────────
-SIM_MAX_RPM = 16000.0
+# Roughly the bench's real setup: a 28" prop on a 12S pack. Thrust
+# follows the T-Motor reference the engineer compared against (57.7 N at
+# 3280 rpm). The DC current is DERIVED from shaft power through a
+# plausible motor+ESC efficiency curve, so the CSV's power and efficiency
+# columns come out physically consistent (the old constants implied
+# ~1800 % efficiency at full throttle).
+SIM_MAX_RPM = 4000.0
 SIM_RPM_TAU_S = 0.9                  # First-order lag toward the commanded speed
-SIM_THRUST_COEFF = 3.9               # Per (krpm)² — thrust and torque both go as rpm²
-SIM_TORQUE_COEFF = 0.052
+SIM_THRUST_COEFF = 5.36              # N per (krpm)² — thrust and torque both go as rpm²
+SIM_TORQUE_COEFF = 0.186             # N·m per (krpm)²: ~2 N·m, ~690 W shaft at 3280 rpm
 SIM_TORQUE_ARM_M = 0.18
-SIM_IDLE_CURRENT_A = 0.6
-SIM_MAX_CURRENT_A = 52.0
-SIM_CURRENT_EXPONENT = 2.1
-SIM_PACK_VOLTAGE_V = 24.6
+SIM_IDLE_CURRENT_A = 0.6             # ESC + motor at standstill
+SIM_EFFICIENCY = (0.62, 0.50, -0.38) # eta(m) = a + b*m + c*m², m = rpm / max: ~70 % low, ~78 % mid, ~74 % full
+SIM_PACK_VOLTAGE_V = 50.4            # 12S
 SIM_PACK_RESISTANCE_OHM = 0.035
 # AC side (motor phases). Phase RMS current tracks the DC current; the
 # per-phase factors give a small, visible imbalance so the three cards
@@ -62,9 +68,11 @@ SIM_AC_PHASE_IMBALANCE = (1.00, 0.97, 1.03)
 SIM_AC_VOLTAGE_RATIO = 0.61          # Line-to-line RMS ≈ 0.61 × V_dc at full modulation
 SIM_SETTLED_RPM_ABS = 60.0           # Whichever of these is larger counts as settled
 SIM_SETTLED_RPM_FRAC = 0.01
-SIM_TARE_S = 2.0                     # Matches the firmware: 20 samples per cell at 10 SPS
+SIM_TARE_S = 3.0                     # Matches the firmware: the current zeros are averaged over 3 s
 SIM_TARE_SAMPLES = 20
 SIM_TARE_CELLS = ("s1", "s2", "s3", "s4", "thrust")
+# Current sensors in TARE_DONE: firmware key -> samples it gets in the 3 s window
+SIM_TARE_CURRENTS = {"current": 60, "current2": 16, "current3": 16, "current4": 16}
 
 
 def replay_enabled() -> bool:
@@ -94,7 +102,9 @@ def load_frames(path: str) -> list[dict]:
         # Map the console's own CSV headers back to telemetry keys. The
         # current recorder.COLUMNS labels come first; the pre-AC-sensor
         # labels stay so runs recorded before the rename still replay.
-        column_to_key = {label: key for label, key in COLUMNS if key != "ts"}
+        # Power/efficiency columns are computed from the others, not telemetry.
+        column_to_key = {label: key for label, key in COLUMNS
+                         if key != "ts" and key not in DERIVED_KEYS}
         column_to_key.update({
             "Current (A)": "current_a", "Voltage (V)": "voltage_v",
             "Current 2 (A)": "current_a2", "Voltage 2 (V)": "voltage_v2",
@@ -167,12 +177,15 @@ class _Simulator:
         s1 = thrust / 40 + random.gauss(0, 0.01)
         s2 = -thrust / 45 + random.gauss(0, 0.01)
 
-        current = (SIM_IDLE_CURRENT_A + SIM_MAX_CURRENT_A * frac ** SIM_CURRENT_EXPONENT
+        motor_frac = self.rpm / SIM_MAX_RPM          # Follows the motor, not the command
+        a, b, c = SIM_EFFICIENCY
+        eta = a + b * motor_frac + c * motor_frac ** 2
+        shaft_w = 2 * math.pi * self.rpm / 60 * SIM_TORQUE_COEFF * n2
+        current = (SIM_IDLE_CURRENT_A + shaft_w / (eta * SIM_PACK_VOLTAGE_V)
                    + random.gauss(0, 0.15))
         voltage = (SIM_PACK_VOLTAGE_V - current * SIM_PACK_RESISTANCE_OHM
                    + random.gauss(0, 0.02))
 
-        motor_frac = self.rpm / SIM_MAX_RPM          # Follows the motor, not the command
         ac_currents = [
             max(0.0, current * SIM_AC_CURRENT_RATIO * k * motor_frac ** 0.5
                 + random.gauss(0, 0.1))
@@ -277,8 +290,13 @@ class ReplaySerial:
     def _tare_done_line(self) -> bytes:
         cells = {k: {"n": SIM_TARE_SAMPLES, "sd_kg": round(random.uniform(0.0002, 0.0006), 5)}
                  for k in SIM_TARE_CELLS}
+        # A simulated sensor at rest is always settled.
+        currents = {k: {"n": n, "zero_v": 0.0, "sd_a": round(random.uniform(0.02, 0.06), 3),
+                        "drift_a": round(random.uniform(-0.05, 0.05), 3)}
+                    for k, n in SIM_TARE_CURRENTS.items()}
         return (json.dumps({"event": EV_TARE_DONE, "ok": True, "ms": int(SIM_TARE_S * 1000),
-                            "samples": SIM_TARE_SAMPLES, "cells": cells, "failed": []})
+                            "samples": SIM_TARE_SAMPLES, "cells": cells, "currents": currents,
+                            "failed": [], "unsettled": []})
                 + "\n").encode()
 
     def write(self, data: bytes) -> int:

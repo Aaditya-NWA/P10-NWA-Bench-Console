@@ -46,6 +46,27 @@ describe("ESP32 communication card", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("shows the USB link state in words while closed", () => {
+    renderCard();
+    expect(screen.getByText("USB: CONNECTED")).toBeTruthy();
+  });
+
+  it("says USB: WARNING when packets are late, DISCONNECTED when they stop", () => {
+    const { unmount } = renderCard({ lagMs: 500 });
+    expect(screen.getByText("USB: WARNING")).toBeTruthy();
+    unmount();
+    renderCard({ lagMs: 3000 });
+    expect(screen.getByText("USB: DISCONNECTED")).toBeTruthy();
+  });
+
+  it("says USB: DISCONNECTED with no port open, UNKNOWN without the backend", () => {
+    const { unmount } = renderCard({ serialConnected: false });
+    expect(screen.getByText("USB: DISCONNECTED")).toBeTruthy();
+    unmount();
+    renderCard({ wsConnected: false });
+    expect(screen.getByText("USB: UNKNOWN")).toBeTruthy();
+  });
+
   it("opens to the status and the link's numbers", async () => {
     renderCard();
     await openCard();

@@ -22,19 +22,35 @@ const CELL_LABEL = {
 export function summarizeTare(msg) {
   const cells = msg?.cells;
   if (!cells || typeof cells !== "object") {
-    return { ok: true, legacy: true, ms: null, failed: [], noisy: [], detail: "" };
+    return { ok: true, legacy: true, ms: null, failed: [], noisy: [], unsettled: [], detail: "" };
   }
 
-  const failed = (Array.isArray(msg.failed) ? msg.failed : []).map((k) => CELL_LABEL[k] ?? k);
+  const label = (k) => CELL_LABEL[k] ?? k;
+  const failed = (Array.isArray(msg.failed) ? msg.failed : []).map(label);
+  // Current sensors whose output was still moving during the tare
+  // (firmware compares the two halves of its 3 s window). Their zero was
+  // applied, from the later half, but will likely need another tare.
+  // Absent from firmware before 2026-11.
+  const unsettled = (Array.isArray(msg.unsettled) ? msg.unsettled : []).map(label);
   const noisy = [];
   const parts = [];
   for (const [key, c] of Object.entries(cells)) {
-    const label = CELL_LABEL[key] ?? key;
+    const name = label(key);
     if (!c || !(c.n > 0)) continue;
     const zeroUncertainty = (c.sd_kg ?? 0) / Math.sqrt(c.n);
     const limit = key === "thrust" ? TARE_ZERO_LIMIT_KG.thrust : TARE_ZERO_LIMIT_KG.beam;
-    if (zeroUncertainty > limit) noisy.push(label);
-    parts.push(`${label}: ${c.n} samples, σ ${(c.sd_kg * 1000).toFixed(2)} g`);
+    if (zeroUncertainty > limit) noisy.push(name);
+    parts.push(`${name}: ${c.n} samples, σ ${(c.sd_kg * 1000).toFixed(2)} g`);
+  }
+
+  const currents = msg.currents && typeof msg.currents === "object" ? msg.currents : {};
+  for (const [key, c] of Object.entries(currents)) {
+    if (!c || !(c.n > 0)) continue;
+    const drift = Number(c.drift_a ?? 0);
+    parts.push(
+      `${label(key)}: ${c.n} samples, σ ${Number(c.sd_a ?? 0).toFixed(2)} A, ` +
+      `drift ${drift >= 0 ? "+" : ""}${drift.toFixed(2)} A`,
+    );
   }
 
   return {
@@ -43,6 +59,7 @@ export function summarizeTare(msg) {
     ms: typeof msg.ms === "number" ? msg.ms : null,
     failed,
     noisy,
+    unsettled,
     detail: parts.join("\n"),
   };
 }

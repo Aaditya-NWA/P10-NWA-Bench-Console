@@ -45,6 +45,33 @@ describe("summarizeTare", () => {
     expect(r.failed).toEqual(["DC Current", "AC Current 1", "AC Current 2", "AC Current 3"]);
   });
 
+  it("names current sensors that were still drifting, without calling the tare failed", () => {
+    // Firmware applies their zero (from the later half of its window) but
+    // reports the drift — the reading will likely creep off 0 again.
+    const r = summarizeTare({
+      event: "TARE_DONE", ok: true, ms: 3050, failed: [],
+      cells: { s1: quiet, s2: quiet, s3: quiet, s4: quiet, thrust: quiet },
+      currents: {
+        current:  { n: 60, zero_v: 0.0123, sd_a: 0.4, drift_a: -4.2 },
+        current2: { n: 16, zero_v: 0.0004, sd_a: 0.02, drift_a: 0.01 },
+      },
+      unsettled: ["current"],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.unsettled).toEqual(["DC Current"]);
+    expect(r.detail).toContain("DC Current: 60 samples, σ 0.40 A, drift -4.20 A");
+    expect(r.detail).toContain("AC Current 1: 16 samples, σ 0.02 A, drift +0.01 A");
+  });
+
+  it("treats a TARE_DONE without current details (pre-2026-11 firmware) as settled", () => {
+    const r = summarizeTare({
+      event: "TARE_DONE", ok: true, ms: 2013, failed: [],
+      cells: { s1: quiet, s2: quiet, s3: quiet, s4: quiet, thrust: quiet },
+    });
+    expect(r.unsettled).toEqual([]);
+    expect(summarizeTare({ event: "TARE_DONE" }).unsettled).toEqual([]);
+  });
+
   it("flags a cell whose zero is less certain than the display dead band", () => {
     // sd 0.05 kg over 20 samples → ±0.011 kg on the zero, past the
     // 0.005 kg beam dead band: someone was leaning on the rig.

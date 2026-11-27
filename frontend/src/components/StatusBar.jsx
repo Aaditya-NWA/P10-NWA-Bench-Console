@@ -77,6 +77,8 @@ export default function StatusBar({
   // sampled. Both are said on the button rather than buried in a log.
   const tarePartial = tareStatus === TARE_STATUS.DONE && tareResult && !tareResult.ok;
   const tareNoisy   = tareStatus === TARE_STATUS.DONE && tareResult?.ok && tareResult.noisy.length > 0;
+  const tareUnsettled = tareStatus === TARE_STATUS.DONE && tareResult?.ok &&
+                        (tareResult.unsettled?.length ?? 0) > 0;
   const tareSecs    = tareResult?.ms != null ? ` ${(tareResult.ms / 1000).toFixed(1)} s` : "";
 
   const tareLabel =
@@ -84,6 +86,7 @@ export default function StatusBar({
     tareStatus === TARE_STATUS.SENT    ? "Command Sent" :
     tareStatus === TARE_STATUS.TARING  ? "Taring… hold still" :
     tarePartial                        ? `Tare partial — ${tareResult.failed.join(", ")} unchanged` :
+    tareUnsettled                      ? `${tareResult.unsettled.join(", ")} still settling — tare again` :
     tareNoisy                          ? `Tare done — ${tareResult.noisy.join(", ")} noisy` :
     tareStatus === TARE_STATUS.DONE    ? `Tare Done ✓${tareSecs}` :
     tareStatus === TARE_STATUS.ERROR   ? "Serial Error" :
@@ -91,6 +94,7 @@ export default function StatusBar({
 
   const tareColour =
     tarePartial                        ? "var(--status-offline)"  :
+    tareUnsettled                      ? "var(--status-settling)" :
     tareNoisy                          ? "var(--status-settling)" :
     tareStatus === TARE_STATUS.DONE    ? "var(--status-stable)"   :
     tareStatus === TARE_STATUS.ERROR   ? "var(--status-offline)"  :
@@ -108,12 +112,16 @@ export default function StatusBar({
       ? "The connected firmware build doesn't appear to process tare/throttle commands (RPM test pass) — this may have no effect on the device."
     : tarePartial
       ? `These kept their previous zero because they returned too few samples: ${tareResult.failed.join(", ")}. Check their wiring, then tare again.`
+    : tareUnsettled
+      ? `${tareResult.unsettled.join(", ")} was still drifting while it was zeroed — its output moved by more than 0.5 A during the 3 s tare. Its zero was taken from the later readings, but it will probably drift off 0 again. Wait until the reading stops moving (motor fully stopped, sensor warmed up), then tare again. If it never settles, check that sensor's supply and wiring.
+
+${tareResult.detail}`
     : tareNoisy
       ? `The zero for ${tareResult.noisy.join(", ")} is less certain than the display resolution — something was touching or shaking the rig. Tare again with it still.
 
 ${tareResult.detail}`
     : tareResult?.detail
-      ? `Re-zero all four beam cells, the thrust cell and the DC + AC current sensors (~2 s).
+      ? `Re-zero all four beam cells, the thrust cell and the DC + AC current sensors (~3 s).
 
 Last tare:
 ${tareResult.detail}`
@@ -445,12 +453,14 @@ const styles = {
     maxWidth:       "200px",
     cursor:         "pointer",
   },
+  // Neutral on purpose: an open port is not a working link. The colour
+  // that means "data is arriving" lives on the USB chip next to it.
   portConnected: {
     display:        "flex",
     alignItems:     "center",
     gap:            "0.5rem",
-    background:     "rgba(76,186,106,0.10)",
-    border:         "1px solid var(--status-stable)",
+    background:     "var(--bg-elevated)",
+    border:         "1px solid var(--bg-border)",
     borderRadius:   "var(--radius-sm)",
     padding:        "0.3rem 0.5rem 0.3rem 0.7rem",
   },
@@ -458,7 +468,7 @@ const styles = {
     fontFamily:     "var(--font-mono)",
     fontSize:       "0.76rem",
     fontWeight:     600,
-    color:          "var(--status-stable)",
+    color:          "var(--text-primary)",
   },
   disconnectBtn: {
     background:     "transparent",

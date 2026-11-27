@@ -153,7 +153,7 @@ export function useSerialData({ enabled = true } = {}) {
         if (msg.event === FW_EVENT.TARE_DONE) {
           const result = summarizeTare(msg);
           setTareResult(result);
-          const clean = result.ok && result.noisy.length === 0;
+          const clean = result.ok && result.noisy.length === 0 && result.unsettled.length === 0;
           showTare(TARE_STATUS.DONE, clean ? TARE_STATUS_CLEAR_MS : TARE_RESULT_SHOW_MS);
           return;
         }

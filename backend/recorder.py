@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import threading
 import time
 from datetime import datetime
@@ -29,8 +30,7 @@ FILE_STAMP_FORMAT = "%Y%m%d_%H%M%S"
 DEFAULT_RUN_NAME = "run"
 LIST_LIMIT = 40
 
-# Column order shared by the streamed CSV and the .xlsx export, so the
-# two views of one run never disagree about what column 7 is.
+# Column order of the streamed CSV (replay.load_frames reads it back).
 COLUMNS: list[tuple[str, str]] = [
     ("Timestamp",     "ts"),
     ("Torque (N·m)",  "torque"),
@@ -54,16 +54,62 @@ COLUMNS: list[tuple[str, str]] = [
     ("AC Current 2 (A)", "current_a3"),
     ("AC Current 3 (A)", "current_a4"),
     ("AC Voltage (V)",   "voltage_v2"),
+    # Derived here from the frame, not sent by the firmware (power_figures).
+    # Labels avoid "rpm"/"torque"/"thrust": analysis.py finds those columns
+    # by keyword and takes the first match.
+    ("Electrical Power (W)",     "p_elec_w"),
+    ("Mechanical Power (W)",     "p_mech_w"),
+    ("Motor+ESC Efficiency (%)", "eff_pct"),
 ]
+
+DERIVED_KEYS = frozenset({"p_elec_w", "p_mech_w", "eff_pct"})
+
+# Below this DC input power the efficiency cell is left blank. At idle
+# both powers are a few watts of sensor noise, and their ratio swings
+# between nonsense values (or divides by zero) instead of meaning anything.
+EFFICIENCY_MIN_ELEC_W = 5.0
 
 FLUSH_INTERVAL_S = 1.0
 
 
+def _num(frame: dict, key: str) -> float | None:
+    v = frame.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return float(v)
+
+
+def power_figures(frame: dict) -> dict:
+    """Electrical, mechanical power and motor+ESC efficiency for one frame.
+
+    Electrical (DC input) = V_DC * I_DC. Mechanical (shaft) =
+    2*pi*RPM*torque/60, on magnitudes: torque's sign follows the spin
+    direction and would otherwise make CCW runs negative. Efficiency =
+    mechanical / electrical * 100, blank below EFFICIENCY_MIN_ELEC_W.
+    A figure whose inputs are missing is None (an empty CSV cell).
+    """
+    v, i = _num(frame, "voltage_v"), _num(frame, "current_a")
+    rpm, tq = _num(frame, "rpm"), _num(frame, "torque")
+    p_elec = v * i if v is not None and i is not None else None
+    p_mech = 2 * math.pi * abs(rpm) * abs(tq) / 60 if rpm is not None and tq is not None else None
+    eff = None
+    if p_elec is not None and p_mech is not None and p_elec >= EFFICIENCY_MIN_ELEC_W:
+        eff = p_mech / p_elec * 100
+    return {
+        "p_elec_w": None if p_elec is None else round(p_elec, 2),
+        "p_mech_w": None if p_mech is None else round(p_mech, 2),
+        "eff_pct":  None if eff is None else round(eff, 1),
+    }
+
+
 def frame_row(frame: dict) -> list:
     """One telemetry frame as a row in COLUMNS order."""
+    derived = power_figures(frame)
     row = []
     for _, key in COLUMNS:
-        if key == "ts":
+        if key in derived:
+            row.append(derived[key])
+        elif key == "ts":
             row.append(
                 datetime.fromtimestamp(frame.get("ts", 0)).strftime(TIMESTAMP_FORMAT)[:-3]
             )

@@ -114,6 +114,12 @@ static volatile int current_throttle_us = THR_MIN;
 
 #define ADS_LSB              0.000125f   // LSB size for the ±4.096V PGA range
 
+// Conversion-complete polling (see ads1115_read_channel_dev).
+// Each poll waits one RTOS tick first, so the wait is at least ~0 ms and
+// at most one tick per poll. 20 polls comfortably covers the ~7.8 ms
+// conversion even at a 100 Hz tick (10 ms per poll).
+#define ADS_POLL_MAX            20
+
 // Resistor network reverse calculation — verified correct, do not change
 #define NETWORK_GAIN            2.925f
 #define NETWORK_OFFSET          4.853f
@@ -124,8 +130,11 @@ static volatile int current_throttle_us = THR_MIN;
 // a permanent bias the way the old fixed constant did.
 #define CURRENT_ZERO_OFFSET_V 0.104076f
 #define CURRENT_SCALE          160.02 // 1-input
-#define CURRENT_ZERO_CAL_SAMPLES     20  // Samples averaged when re-zeroing on tare
-#define CURRENT_DEADBAND_A        0.05f  // Clamps residual post-tare creep to exactly 0.00 A
+#define CURRENT_ZERO_CAL_SAMPLES     20  // Samples averaged for the BOOT zero; a runtime tare uses TARE_CUR_WINDOW_MS
+#define CURRENT_DEADBAND_A        0.15f  // Clamps residual post-tare noise to exactly 0.00 A. Was 0.05 A, which is
+                                         //   SMALLER than one ADC step on the DC channel (0.125 mV x 2.925 x 160 A/V
+                                         //   = 0.059 A), so a zero a fraction of a step off never showed 0.00.
+                                         //   0.15 A is ~2.5 DC steps / ~8 AC steps; also applies to the AC currents.
 
 // LV25-P
 #define VOLTAGE_ZERO_OFFSET_V     0.0981f
@@ -319,6 +328,38 @@ static float   s_dbg_sensor_out_dhr[DHR_COUNT] = { 0, 0, 0 };
 static int16_t s_dbg_raw_v2 = 0;                       // A3 voltage
 static float   s_dbg_node_v_v2 = 0;
 
+// ── ADS1115 #1 raw statistics (diagnostic only) ──────────────────
+//   Accumulated over each ~2 s log window from the RAW 16-bit counts,
+//   BEFORE any scaling, despike or EMA, so "is the ADC itself seeing
+//   the swing?" can be answered separately from "is processing making
+//   it?". Written and emitted by measurement_task only, so no lock.
+//   Printed as [ADS1 STATS 2s] in the exact shape rig_diag.py parses.
+typedef struct {
+    int32_t n;                           // Raw samples in this window
+    int32_t mn, mx;                      // Raw count extremes
+    int32_t rej;                         // Samples the despike filter rejected
+    int64_t sum;                         // For the mean
+} ads_stat_t;
+
+static ads_stat_t s_stat_a0, s_stat_a1;
+// Reads where the conversion was NOT yet complete at the first check.
+// With the old fixed 10 ms wait those reads would have returned stale
+// data (the previous channel's result). Diagnostic; written by whichever
+// task is reading, a 32-bit aligned increment is fine for a rough count.
+static volatile uint32_t s_ads_not_ready_first = 0;
+
+static void ads_stat_reset(ads_stat_t *s) {
+    s->n = 0; s->mn = INT32_MAX; s->mx = INT32_MIN; s->rej = 0; s->sum = 0;
+}
+
+static void ads_stat_add(ads_stat_t *s, int16_t raw, bool rejected) {
+    if (raw < s->mn) s->mn = raw;
+    if (raw > s->mx) s->mx = raw;
+    s->sum += raw;
+    s->n++;
+    if (rejected) s->rej++;
+}
+
 // Set up once in i2c_master_init(), used by every read afterwards
 static i2c_master_bus_handle_t s_i2c_bus   = NULL;
 static i2c_master_dev_handle_t s_ads1115_dev = NULL;  // Bound to ADS1115_ADDR on that bus
@@ -392,6 +433,57 @@ static hx711_t thrust_cell = {
 #define TQ_K4_CCW  -0.28771460f   // prev -0.26855281f  //16 - input
 
 #define TQ_HYST_KG   0.050f               // Band (kg on S3) around zero for CW/CCW switching
+
+// ── Layer 2: torque plausibility gate (throttle-change spikes) ───
+//   The reaction torque on the stator is the motor's air-gap torque,
+//   which cannot exceed electrical input power divided by shaft speed:
+//       |torque| <= MARGIN * (V * |I|) / omega + FLOOR
+//   During throttle changes the cells can show 7-50 N.m while the DC bus
+//   current is 0 A: that cannot be motor torque, so the last plausible
+//   torque is held instead (and "stable" is reported false) until the
+//   reading is plausible again. omega is floored at TQ_PLAUS_MIN_RPM so
+//   a stopped or slow prop does not give an unbounded limit. The hold
+//   is capped at TQ_PLAUS_MAX_HOLD_MS so a persistent real or faulty
+//   reading is never hidden; after that the raw value passes through.
+//   Checked against two logged runs (~4000 rows): it flagged only the
+//   spike rows and no normal row, including full ramps.
+//   It relies on the DC current and RPM readings being sane.
+#define TQ_PLAUS_ENABLE       1
+#define TQ_PLAUS_MARGIN       2.0f
+#define TQ_PLAUS_FLOOR_NM     0.30f
+#define TQ_PLAUS_MIN_RPM      300.0f
+#define TQ_PLAUS_MAX_HOLD_MS  3000
+
+static float   s_tq_last_good  = 0.0f;
+static int64_t s_tq_hold_since = 0;
+static bool    s_tq_holding    = false;
+
+// Returns the torque to publish. *held is true while a spike is being
+// replaced by the last plausible value.
+static float torque_plausibility_gate(float tau, float rpm, float amps, float volts, bool *held) {
+    *held = false;
+#if TQ_PLAUS_ENABLE
+    float w_rpm = fmaxf(fabsf(rpm), TQ_PLAUS_MIN_RPM);
+    float omega = w_rpm * 0.10471976f;                         // rad/s
+    float p_w   = fmaxf(volts, 10.0f) * fabsf(amps);           // Electrical input power, W
+    float limit = TQ_PLAUS_FLOOR_NM + TQ_PLAUS_MARGIN * p_w / omega;
+    if (fabsf(tau) <= limit) {
+        s_tq_last_good = tau;
+        s_tq_holding   = false;
+        return tau;
+    }
+    int64_t now = esp_timer_get_time();
+    if (!s_tq_holding) { s_tq_holding = true; s_tq_hold_since = now; }
+    if ((now - s_tq_hold_since) > (int64_t)TQ_PLAUS_MAX_HOLD_MS * 1000) {
+        return tau;                                            // Held long enough: do not hide it any longer
+    }
+    *held = true;
+    return s_tq_last_good;
+#else
+    (void)rpm; (void)amps; (void)volts;
+    return tau;
+#endif
+}
 
 // ================================================================
 // RUNTIME CALIBRATION TABLE
@@ -562,6 +654,22 @@ static bool cal_erase_nvs(void) {
 #define STABLE_WIN    6                  // Stability detection window, samples
 #define STABLE_THR    0.100f             // Max peak-to-peak (kg) to declare stable
 
+// ── Layer 1: single-sample glitch rejection, per beam cell ───────
+//   A bad HX711 sample (EMI from the ESC during throttle changes, a bit
+//   slip) used to go straight into the 5-sample moving average and show
+//   up as a flat spike lasting ~0.5-0.8 s (seen: S1 -21 kg and S4 -3.2 kg
+//   plateaus, 50 N.m of fake torque). A sample further than
+//   CELL_OUTLIER_KG from the median of the last three accepted samples
+//   is replaced by that median BEFORE it reaches the average. After
+//   CELL_OUTLIER_MAX_RUN rejections in a row the new level is accepted
+//   as real and the history re-baselines, so a true fast step is only
+//   delayed by a few samples (~0.3 s at 10 SPS), never blocked.
+//   Raise CELL_OUTLIER_KG if a bigger motor/prop makes real torque move
+//   more than this per sample.
+#define CELL_OUTLIER_ENABLE   1
+#define CELL_OUTLIER_KG       0.50f
+#define CELL_OUTLIER_MAX_RUN  3
+
 // ── Per-channel beam cell state ──────────────────────────────────
 typedef struct {
     float sm_buf[SMOOTH_N];              // Circular smoothing buffer
@@ -569,6 +677,8 @@ typedef struct {
     float st_buf[STABLE_WIN];            // Circular stability window
     int   st_idx, st_filled;
     long  offset;                        // Tare offset, raw ADC counts
+    float rj_buf[3];                     // Last three accepted samples (outlier rejection)
+    int   rj_n, rj_run;                  // Seeded count, consecutive rejections
 } Chan;
 
 static Chan CH[4];   // 0=S1  1=S2  2=S3  3=S4
@@ -581,6 +691,36 @@ static bool s_is_ccw = false;
 // ================================================================
 // BEAM CELL DSP HELPERS
 // ================================================================
+static float ch_reject_outlier(Chan *c, float w) {
+#if CELL_OUTLIER_ENABLE
+    if (c->rj_n < 3) {                                 // Seeding after boot/tare: accept
+        c->rj_buf[c->rj_n++] = w;
+        c->rj_run = 0;
+        return w;
+    }
+    float a = c->rj_buf[0], b = c->rj_buf[1], m = c->rj_buf[2];
+    float lo = fminf(a, b), hi = fmaxf(a, b);
+    float med = fmaxf(lo, fminf(hi, m));               // Median of three
+    if (fabsf(w - med) > CELL_OUTLIER_KG) {
+        if (c->rj_run < CELL_OUTLIER_MAX_RUN) {
+            c->rj_run++;
+            return med;                                // Bad sample: repeat the recent median
+        }
+        c->rj_buf[0] = c->rj_buf[1] = c->rj_buf[2] = w; // Persisted: it is real, re-baseline
+        c->rj_run = 0;
+        return w;
+    }
+    c->rj_run = 0;
+    c->rj_buf[0] = c->rj_buf[1];
+    c->rj_buf[1] = c->rj_buf[2];
+    c->rj_buf[2] = w;
+    return w;
+#else
+    (void)c;
+    return w;
+#endif
+}
+
 static float ch_smooth(Chan *c, float v) {
     c->sm_buf[c->sm_idx] = v;
     c->sm_idx = (c->sm_idx + 1) % SMOOTH_N;
@@ -667,6 +807,51 @@ static float thrust_linearity_correction(float weight) {
 }
 
 // ================================================================
+// THRUST INTERPOLATION TABLE  (running-prop correction, 28" prop)
+//   Built from the 28" prop run (run_20261125_133740) compared at equal
+//   RPM against the T-Motor V804 reference (CW_TMOTOR_NS_28_2_0_0_V804,
+//   48 V). meas_N is what this firmware reports after the polynomial
+//   above (steady-state plateaus, ramp + ramp-down averaged); true_N is the
+//   reference thrust at the same RPM.
+//
+//   Applied AFTER thrust_linearity_correction() and its dead band, to the
+//   value that goes out in the telemetry line. Piecewise linear between
+//   knots; above the last knot it extrapolates with the last segment's
+//   slope (the run only reached ~34 N, so treat anything above that as
+//   UNVERIFIED). Zero and negative readings pass through unchanged so
+//   noise around zero is not amplified.
+//
+//   Re-measure these knots with a prop run whenever the thrust mounting,
+//   prop or motor changes. Set THRUST_INTERP_ENABLE to 0 to bypass.
+// ================================================================
+#define THRUST_INTERP_ENABLE 1
+
+typedef struct { float meas_N; float true_N; } thrust_pt_t;
+
+static const thrust_pt_t THRUST_TABLE[] = {
+    {  0.00f,  0.00f },
+    {  1.90f,  5.28f },   // ~1050 rpm (low end: up/down branches differ by ~0.5 N)
+    {  8.70f, 17.40f },   // ~1820 rpm
+    { 19.70f, 34.90f },   // ~2570 rpm
+    { 33.60f, 57.70f },   // ~3280 rpm  (highest point measured)
+};
+#define THRUST_TABLE_N  (sizeof(THRUST_TABLE) / sizeof(THRUST_TABLE[0]))
+
+static float thrust_interp_N(float meas_N) {
+#if THRUST_INTERP_ENABLE
+    if (meas_N <= 0.0f) return meas_N;
+    size_t i = 1;
+    while (i < THRUST_TABLE_N - 1 && meas_N > THRUST_TABLE[i].meas_N) i++;
+    const thrust_pt_t *p0 = &THRUST_TABLE[i - 1];
+    const thrust_pt_t *p1 = &THRUST_TABLE[i];
+    float slope = (p1->true_N - p0->true_N) / (p1->meas_N - p0->meas_N);
+    return p0->true_N + slope * (meas_N - p0->meas_N);   // i is the last segment above the table, so this extrapolates
+#else
+    return meas_N;
+#endif
+}
+
+// ================================================================
 // PER-CELL LINEARITY CORRECTIONS  (from beam_cell_calibration.c)
 // ================================================================
 static float correct_S1(float w) {                     // Cubic
@@ -734,9 +919,28 @@ static void beam_tare_all(int samples) {
 // ================================================================
 #define TARE_SAMPLES        20           // Per load cell, ~2 s at 10 SPS
 #define TARE_MIN_SAMPLES     5           // Below this a cell keeps its previous zero
-#define TARE_TIMEOUT_MS   4000           // 2x the expected duration
+#define TARE_TIMEOUT_MS   5000           // Comfortably past the 3 s current window below
 #define TARE_CELLS           5           // S1-S4, then the thrust cell
 #define TARE_THRUST          4
+
+// Current-sensor zeros [2026-11]. Collected for a fixed TIME rather than a
+// sample count, because the channels arrive at different rates: the DC
+// sensor is read every 50 ms loop (~60 samples in 3 s), each AC sensor only
+// every ~180 ms (ads2_task cycles four channels, ~16 samples in 3 s).
+// The old 20-sample zero was ~1 s of DC data and was accepted even when
+// the sensor output was still moving (Hall-sensor offset relaxing after a
+// run, an RMS output still decaying after the motor stopped, a supply
+// still settling) — the zero then landed amps away from the true rest
+// value and the operator had to tare repeatedly. Now the window is split
+// in halves: if the two half-means differ by more than TARE_CUR_DRIFT_LIMIT_A
+// the sensor is reported "unsettled" in TARE_DONE, and the zero is taken
+// from the SECOND half (nearer where the output is heading) instead of
+// silently averaging across the drift.
+#define TARE_CUR_WINDOW_MS      3000     // Current zeros are averaged over this long
+#define TARE_CUR_MAX_SAMPLES      64     // Buffer per sensor; DC fills ~60 of it in the window
+#define TARE_CUR_MIN_SAMPLES       6     // Below this a current sensor keeps its previous zero
+#define TARE_CUR_DRIFT_LIMIT_A  0.5f     // |second-half mean - first-half mean| above this = still settling
+#define TARE_CUR_COUNT  (1 + DHR_COUNT)  // Slot 0 = DC (HAS-600S), 1..3 = AC 1..3 (DHR)
 
 typedef struct {
     long   ref;                          // First sample; the rest accumulate as deviations from it,
@@ -747,11 +951,18 @@ typedef struct {
 
 static const char *const TARE_CELL_KEYS[TARE_CELLS] = { "s1", "s2", "s3", "s4", "thrust" };
 
+// Every current sample of the window is kept (not just a running sum) so
+// the two halves can be compared for drift. sensor_out volts, as the
+// zero is stored.
+typedef struct {
+    float v[TARE_CUR_MAX_SAMPLES];
+    int   n;
+} tare_cur_t;
+
+static const char *const TARE_CUR_KEYS[TARE_CUR_COUNT] = { "current", "current2", "current3", "current4" };
+
 static tare_acc_t    s_tare_acc[TARE_CELLS];
-static double        s_tare_cur_sum  = 0.0;   // Current channel's sensor_out volts, for the current zero
-static int           s_tare_cur_n    = 0;
-static double        s_tare_dhr_sum[DHR_COUNT] = { 0.0, 0.0, 0.0 };   // DHR current zeros; only fed while SENSOR2_ENABLED
-static int           s_tare_dhr_n[DHR_COUNT]   = { 0, 0, 0 };
+static tare_cur_t    s_tare_cur[TARE_CUR_COUNT];   // AC slots only fed while SENSOR2_ENABLED
 static bool          s_tare_active   = false;
 static bool          s_tare_with_current = false;
 static int64_t       s_tare_started_us = 0;
@@ -759,8 +970,7 @@ static volatile bool s_tare_requested = false; // Raised by command_task, consum
 
 static void tare_begin(bool with_current) {
     memset(s_tare_acc, 0, sizeof(s_tare_acc));
-    s_tare_cur_sum  = 0.0; s_tare_cur_n  = 0;
-    for (int i = 0; i < DHR_COUNT; i++) { s_tare_dhr_sum[i] = 0.0; s_tare_dhr_n[i] = 0; }
+    memset(s_tare_cur, 0, sizeof(s_tare_cur));
     s_tare_with_current = with_current;
     s_tare_started_us   = esp_timer_get_time();
     s_tare_active       = true;
@@ -779,37 +989,77 @@ static void tare_add(int cell, long raw) {
     a->n++;
 }
 
-static void tare_add_current(int pair, float sensor_out_v) {
+static int64_t tare_elapsed_us(void) {
+    return esp_timer_get_time() - s_tare_started_us;
+}
+
+// slot 0 = DC, 1..DHR_COUNT = AC. Only samples inside the window count,
+// so every sensor's zero describes the same 3 s.
+static void tare_cur_add(int slot, float sensor_out_v) {
     if (!s_tare_active || !s_tare_with_current) return;
-    if (pair == 1 && s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) {
-        s_tare_cur_sum += sensor_out_v; s_tare_cur_n++;
-    }
+    if (tare_elapsed_us() > (int64_t)TARE_CUR_WINDOW_MS * 1000) return;
+    tare_cur_t *c = &s_tare_cur[slot];
+    if (c->n < TARE_CUR_MAX_SAMPLES) c->v[c->n++] = sensor_out_v;
+}
+
+static void tare_add_current(float sensor_out_v) {
+    tare_cur_add(0, sensor_out_v);
 }
 
 // DHR sensor `idx` (0..DHR_COUNT-1), fed from dhr_update() in measurement_task.
 static void tare_add_dhr(int idx, float sensor_out_v) {
-    if (!s_tare_active || !s_tare_with_current) return;
-    if (s_tare_dhr_n[idx] < CURRENT_ZERO_CAL_SAMPLES) {
-        s_tare_dhr_sum[idx] += sensor_out_v; s_tare_dhr_n[idx]++;
-    }
+    tare_cur_add(1 + idx, sensor_out_v);
 }
 
 static bool tare_complete(void) {
     for (int i = 0; i < TARE_CELLS; i++)
         if (s_tare_acc[i].n < TARE_SAMPLES) return false;
-    if (s_tare_with_current) {
-        if (s_tare_cur_n < CURRENT_ZERO_CAL_SAMPLES) return false;
-#if SENSOR2_ENABLED
-        if (s_ads2_ready)
-            for (int i = 0; i < DHR_COUNT; i++)
-                if (s_tare_dhr_n[i] < CURRENT_ZERO_CAL_SAMPLES) return false;
-#endif
-    }
+    // Time-based for the currents: the window always runs its full length,
+    // so a fast DC channel can't end the tare before the AC ones have data.
+    if (s_tare_with_current && tare_elapsed_us() < (int64_t)TARE_CUR_WINDOW_MS * 1000)
+        return false;
     return true;
 }
 
 static bool tare_timed_out(void) {
-    return (esp_timer_get_time() - s_tare_started_us) > (int64_t)TARE_TIMEOUT_MS * 1000;
+    return tare_elapsed_us() > (int64_t)TARE_TIMEOUT_MS * 1000;
+}
+
+// Zero, spread and drift of one current sensor's window. Mean/sd/drift
+// are in sensor_out volts here; the caller scales them to amps.
+typedef struct {
+    bool  ok;          // Enough samples to trust a zero at all
+    bool  settled;     // Half-means agree within TARE_CUR_DRIFT_LIMIT_A
+    float zero_v;      // The zero to apply
+    float sd_a;        // Sample spread, amps
+    float drift_a;     // Second-half mean minus first-half mean, amps
+} tare_cur_result_t;
+
+static tare_cur_result_t tare_cur_evaluate(const tare_cur_t *c, float amps_per_volt) {
+    tare_cur_result_t r = { false, true, 0.0f, 0.0f, 0.0f };
+    if (c->n < TARE_CUR_MIN_SAMPLES) return r;
+    r.ok = true;
+
+    int    half = c->n / 2;
+    double sum_all = 0.0, sum_a = 0.0, sum_b = 0.0;
+    for (int i = 0; i < c->n; i++) {
+        sum_all += c->v[i];
+        if (i < half) sum_a += c->v[i]; else sum_b += c->v[i];
+    }
+    double mean   = sum_all / c->n;
+    double mean_a = sum_a / half;
+    double mean_b = sum_b / (c->n - half);
+    double ss = 0.0;
+    for (int i = 0; i < c->n; i++) ss += (c->v[i] - mean) * (c->v[i] - mean);
+
+    float scale = fabsf(amps_per_volt);
+    r.sd_a    = (float)(sqrt(ss / c->n) * scale);
+    r.drift_a = (float)((mean_b - mean_a) * amps_per_volt);
+    r.settled = fabsf(r.drift_a) <= TARE_CUR_DRIFT_LIMIT_A;
+    // A drifting output is better described by where it ended up than by
+    // the average across the drift.
+    r.zero_v  = (float)(r.settled ? mean : mean_b);
+    return r;
 }
 
 // Old samples in the smoothing and stability windows were measured
@@ -818,6 +1068,7 @@ static bool tare_timed_out(void) {
 static void ch_reset_filters(Chan *c) {
     c->sm_idx = 0; c->sm_filled = 0;
     c->st_idx = 0; c->st_filled = 0;
+    c->rj_n = 0; c->rj_run = 0;                       // Outlier history was against the old zero too
 }
 
 // Applies whatever was gathered and, when emit_event is set, reports it
@@ -853,51 +1104,76 @@ static void tare_finish(bool emit_event) {
         }
     }
 
-    bool current_ok  = true;
-    bool dhr_ok[DHR_COUNT] = { true, true, true };
-    bool dhr_all_ok  = true;
+    // Current sensors. A sensor that is absent (AC side with ADS1115 #2 not
+    // found, or compiled out) is neither zeroed nor reported: that is not
+    // a tare failure.
+    bool cur_present[TARE_CUR_COUNT] = { false };
+    tare_cur_result_t cur[TARE_CUR_COUNT];
+    memset(cur, 0, sizeof(cur));
+    bool currents_ok = true;
     if (s_tare_with_current) {
-        if (s_tare_cur_n > 0) {
-            s_current_zero_offset_v = (float)(s_tare_cur_sum / s_tare_cur_n);
-            ema_current_amps   = 0.0f;              // Snapped, not decayed toward zero over several EMA cycles
-            s_current_hist_n   = 0;                 // Its history is in amps against the OLD zero; left in,
-            s_current_hist_idx = 0;                 //   the despike filter would reject the first few new samples
-        } else {
-            current_ok = false;
-        }
+        cur_present[0] = true;
 #if SENSOR2_ENABLED
-        // If ADS1115 #2 never came up there is nothing to zero, and that is not a tare failure.
-        if (s_ads2_ready) {
-            for (int i = 0; i < DHR_COUNT; i++) {
-                if (s_tare_dhr_n[i] > 0) {
-                    s_dhr_zero_v[i]    = (float)(s_tare_dhr_sum[i] / s_tare_dhr_n[i]);
-                    s_dhr_ema[i]       = 0.0f;       // Snapped, not decayed toward zero over several EMA cycles
-                    s_dhr_hist_n[i]    = 0;          // History is in amps against the OLD zero
-                    s_dhr_hist_idx[i]  = 0;
-                } else {
-                    dhr_ok[i]  = false;
-                    dhr_all_ok = false;
-                }
-            }
-        }
+        for (int i = 0; i < DHR_COUNT; i++) cur_present[1 + i] = s_ads2_ready;
 #endif
+        for (int s = 0; s < TARE_CUR_COUNT; s++) {
+            if (!cur_present[s]) continue;
+            float scale = (s == 0) ? s_cal.current_scale : s_cal.current2_scale;
+            cur[s] = tare_cur_evaluate(&s_tare_cur[s], scale);
+            if (!cur[s].ok) { currents_ok = false; continue; }   // Keeps its previous zero
+            if (s == 0) {
+                s_current_zero_offset_v = cur[s].zero_v;
+                ema_current_amps   = 0.0f;              // Snapped, not decayed toward zero over several EMA cycles
+                s_current_hist_n   = 0;                 // Its history is in amps against the OLD zero; left in,
+                s_current_hist_idx = 0;                 //   the despike filter would reject the first few new samples
+            }
+#if SENSOR2_ENABLED
+            else {
+                int i = s - 1;
+                s_dhr_zero_v[i]   = cur[s].zero_v;
+                s_dhr_ema[i]      = 0.0f;               // Snapped, not decayed toward zero over several EMA cycles
+                s_dhr_hist_n[i]   = 0;                  // History is in amps against the OLD zero
+                s_dhr_hist_idx[i] = 0;
+            }
+#endif
+        }
     }
 
+    bool tare_ok = all_ok && currents_ok;
     ESP_LOGI(TAG, "Tare %s in %lld ms: S1=%ld S2=%ld S3=%ld S4=%ld thrust=%ld (n=%d/%d/%d/%d/%d) current_zero=%.5f V dhr_zero=%.5f/%.5f/%.5f V",
-             all_ok && current_ok && dhr_all_ok ? "done" : "PARTIAL", (long long)elapsed_ms,
+             tare_ok ? "done" : "PARTIAL", (long long)elapsed_ms,
              CH[0].offset, CH[1].offset, CH[2].offset, CH[3].offset, thrust_cell.offset,
              s_tare_acc[0].n, s_tare_acc[1].n, s_tare_acc[2].n, s_tare_acc[3].n, s_tare_acc[4].n,
              (double)s_current_zero_offset_v,
              (double)s_dhr_zero_v[0], (double)s_dhr_zero_v[1], (double)s_dhr_zero_v[2]);
+    for (int s = 0; s < TARE_CUR_COUNT; s++) {
+        if (cur_present[s] && cur[s].ok)
+            ESP_LOGI(TAG, "Tare %s: n=%d zero=%.5f V sd=%.3f A drift=%+.3f A%s",
+                     TARE_CUR_KEYS[s], s_tare_cur[s].n, (double)cur[s].zero_v,
+                     (double)cur[s].sd_a, (double)cur[s].drift_a,
+                     cur[s].settled ? "" : "  <-- STILL SETTLING, zero taken from the last half");
+    }
 
     if (!emit_event) return;
 
-    // ~230 bytes at most. Built first, printed under the mutex in one go.
+    // Built first, printed under the mutex in one go. Up to ~600 bytes
+    // with every sensor reported, i.e. ~50 ms of wire time at 115200 —
+    // one telemetry frame goes out late, once, at the end of a tare.
     char body[320];
     int  n = 0;
     for (int i = 0; i < TARE_CELLS && n < (int)sizeof(body); i++) {
         n += snprintf(body + n, sizeof(body) - n, "%s\"%s\":{\"n\":%d,\"sd_kg\":%.5f}",
                       i ? "," : "", TARE_CELL_KEYS[i], s_tare_acc[i].n, (double)sd_kg[i]);
+    }
+    char currents[384];
+    int  c = 0;
+    currents[0] = '\0';
+    for (int s = 0; s < TARE_CUR_COUNT && c < (int)sizeof(currents); s++) {
+        if (!cur_present[s]) continue;
+        c += snprintf(currents + c, sizeof(currents) - c,
+                      "%s\"%s\":{\"n\":%d,\"zero_v\":%.5f,\"sd_a\":%.3f,\"drift_a\":%.3f}",
+                      c ? "," : "", TARE_CUR_KEYS[s], s_tare_cur[s].n,
+                      (double)cur[s].zero_v, (double)cur[s].sd_a, (double)cur[s].drift_a);
     }
     char failed[96];
     int  f = 0;
@@ -906,16 +1182,22 @@ static void tare_finish(bool emit_event) {
         if (!cell_ok[i])
             f += snprintf(failed + f, sizeof(failed) - f, "%s\"%s\"", f ? "," : "", TARE_CELL_KEYS[i]);
     }
-    if (s_tare_with_current && !current_ok && f < (int)sizeof(failed))
-        f += snprintf(failed + f, sizeof(failed) - f, "%s\"current\"", f ? "," : "");
-    for (int i = 0; i < DHR_COUNT; i++) {
-        if (s_tare_with_current && !dhr_ok[i] && f < (int)sizeof(failed))
-            f += snprintf(failed + f, sizeof(failed) - f, "%s\"current%d\"", f ? "," : "", i + 2);
+    char unsettled[64];
+    int  u = 0;
+    unsettled[0] = '\0';
+    for (int s = 0; s < TARE_CUR_COUNT; s++) {
+        if (!cur_present[s]) continue;
+        if (!cur[s].ok && f < (int)sizeof(failed))
+            f += snprintf(failed + f, sizeof(failed) - f, "%s\"%s\"", f ? "," : "", TARE_CUR_KEYS[s]);
+        else if (cur[s].ok && !cur[s].settled && u < (int)sizeof(unsettled))
+            u += snprintf(unsettled + u, sizeof(unsettled) - u, "%s\"%s\"", u ? "," : "", TARE_CUR_KEYS[s]);
     }
 
     if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
-        printf("{\"event\":\"TARE_DONE\",\"ok\":%s,\"ms\":%lld,\"samples\":%d,\"cells\":{%s},\"failed\":[%s]}\n",
-               all_ok && current_ok && dhr_all_ok ? "true" : "false", (long long)elapsed_ms, TARE_SAMPLES, body, failed);
+        printf("{\"event\":\"TARE_DONE\",\"ok\":%s,\"ms\":%lld,\"samples\":%d,\"cells\":{%s},"
+               "\"currents\":{%s},\"failed\":[%s],\"unsettled\":[%s]}\n",
+               tare_ok ? "true" : "false", (long long)elapsed_ms, TARE_SAMPLES,
+               body, currents, failed, unsettled);
         xSemaphoreGive(s_io_mutex);
     }
 }
@@ -963,6 +1245,7 @@ static void read_all_kg(float kg[4]) {
                     case 2: w = correct_S3(w); break;
                     case 3: w = correct_S4(w); break;
                 }
+                w = ch_reject_outlier(&CH[i], w);               // Drop single bad samples before they are averaged in
                 w = ch_smooth(&CH[i], w);
                 if (fabsf(w) < 0.005f) w = 0.0f;               // Dead band
                 last_kg[i] = w;
@@ -1270,11 +1553,21 @@ static esp_err_t i2c_master_init_2(void) {
 // success with the raw 16-bit result in *out_raw; false on any I2C
 // failure WITHOUT touching *out_raw.
 //
-// Deliberately THREE separate transactions rather than one combined
-// transmit_receive(): config write (own STOP), pointer write (own
-// STOP), then a read with a fresh START. That matches the known-working
-// legacy driver's pattern rather than using a repeated START between
-// the last two, which some ADS1115 breakouts handle unreliably.
+// CONVERSION WAIT: the old code slept a fixed vTaskDelay(pdMS_TO_TICKS(10)).
+// At the ESP-IDF default 100 Hz tick that is ONE tick, which returns
+// anywhere from ~0 to 10 ms later. A 128 SPS conversion takes ~7.8 ms,
+// so a short wake-up read the conversion register before the new result
+// was ready and returned the PREVIOUS conversion — i.e. the other
+// channel's value (A1 sits near 2.5 V, A0 near 1.9 V). Now the config
+// register's OS bit (bit 15: 1 = conversion finished) is polled, so a
+// result is only ever read once it is genuinely complete, whatever the
+// tick rate. s_ads_not_ready_first counts how often the first check
+// found it NOT finished (those would have been stale reads before).
+//
+// Still separate transactions rather than one combined
+// transmit_receive(): each write has its own STOP and each read a fresh
+// START, matching the known-working legacy driver rather than using a
+// repeated START that some ADS1115 breakouts handle unreliably.
 // mtx may be NULL when exactly one task ever uses that bus (ADS1115 #2: ads2_task,
 // or app_main before any task exists).
 static bool ads1115_read_channel_dev(i2c_master_dev_handle_t dev, SemaphoreHandle_t mtx, uint8_t mux_channel, int16_t *out_raw) {
@@ -1305,7 +1598,38 @@ static bool ads1115_read_channel_dev(i2c_master_dev_handle_t dev, SemaphoreHandl
         return false;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));                // Conversion time
+    // Wait until the OS bit says the conversion is finished. The pointer
+    // is already on the config register (the write above left it there),
+    // but it is re-sent each poll so the loop never depends on that.
+    bool done = false;
+    for (int poll = 0; poll < ADS_POLL_MAX; poll++) {
+        vTaskDelay(1);                           // Yields; at least a moment, at most one tick
+
+        uint8_t cfg_ptr = 0x01;
+        err = i2c_master_transmit(dev, &cfg_ptr, 1, 100);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADS1115 ch%d status pointer write failed: %s", mux_channel, esp_err_to_name(err));
+            if (mtx) xSemaphoreGive(mtx);
+            return false;
+        }
+        uint8_t cfg_rd[2];
+        err = i2c_master_receive(dev, cfg_rd, sizeof(cfg_rd), 100);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADS1115 ch%d status read failed: %s", mux_channel, esp_err_to_name(err));
+            if (mtx) xSemaphoreGive(mtx);
+            return false;
+        }
+        if (cfg_rd[0] & 0x80) {                  // OS = 1: conversion complete
+            done = true;                         // Not counted here: a read that needed >1 poll was already counted at poll 0
+            break;
+        }
+        if (poll == 0) s_ads_not_ready_first++;  // First check found it still converting
+    }
+    if (!done) {
+        ESP_LOGE(TAG, "ADS1115 ch%d conversion did not complete after %d polls", mux_channel, ADS_POLL_MAX);
+        if (mtx) xSemaphoreGive(mtx);
+        return false;
+    }
 
     uint8_t pointer = 0x00;                       // Conversion register
     err = i2c_master_transmit(dev, &pointer, 1, 100);
@@ -1342,12 +1666,14 @@ static void ads1115_read_current_voltage(float *out_current_amps, float *out_vol
     if (ads1115_read_channel(ADS_MUX_CURRENT, &raw_a1)) {
         float node_volts_a1   = raw_a1 * ADS_LSB;                      // Counts to volts at the ADC pin
         float sensor_out_a1   = (node_volts_a1 * NETWORK_GAIN) - NETWORK_OFFSET;  // Undo the resistor network
-        tare_add_current(1, sensor_out_a1);                                    // Collected for the new zero during a tare
+        tare_add_current(sensor_out_a1);                                       // Collected for the new zero during a tare
         float current_amps_raw = (sensor_out_a1 - s_current_zero_offset_v) * s_cal.current_scale;  // LIVE, tare-updated zero point
 
         s_dbg_raw_a1 = raw_a1; s_dbg_node_v_a1 = node_volts_a1; s_dbg_sensor_out_a1 = sensor_out_a1;  // For the [ADS DEBUG] log
 
-        if (despike_check(s_current_hist, &s_current_hist_n, &s_current_hist_idx, current_amps_raw, DESPIKE_MAD_FLOOR_A)) {
+        bool keep_a1 = despike_check(s_current_hist, &s_current_hist_n, &s_current_hist_idx, current_amps_raw, DESPIKE_MAD_FLOOR_A);
+        ads_stat_add(&s_stat_a1, raw_a1, !keep_a1);                    // Raw stats for [ADS1 STATS 2s]
+        if (keep_a1) {
             ema_current_amps = ema_initialized
                 ? (EMA_ALPHA_CURRENT * current_amps_raw) + ((1.0f - EMA_ALPHA_CURRENT) * ema_current_amps)
                 : current_amps_raw;
@@ -1364,7 +1690,9 @@ static void ads1115_read_current_voltage(float *out_current_amps, float *out_vol
 
         s_dbg_raw_a0 = raw_a0; s_dbg_node_v_a0 = node_volts_a0; s_dbg_sensor_out_a0 = sensor_out_a0;
 
-        if (despike_check(s_voltage_hist, &s_voltage_hist_n, &s_voltage_hist_idx, bus_voltage_raw, DESPIKE_MAD_FLOOR_V)) {
+        bool keep_a0 = despike_check(s_voltage_hist, &s_voltage_hist_n, &s_voltage_hist_idx, bus_voltage_raw, DESPIKE_MAD_FLOOR_V);
+        ads_stat_add(&s_stat_a0, raw_a0, !keep_a0);                    // Raw stats for [ADS1 STATS 2s]
+        if (keep_a0) {
             ema_bus_voltage = ema_initialized
                 ? (EMA_ALPHA_VOLTAGE * bus_voltage_raw) + ((1.0f - EMA_ALPHA_VOLTAGE) * ema_bus_voltage)
                 : bus_voltage_raw;                                         // Seeded, not ramped up from zero on boot
@@ -1710,7 +2038,7 @@ static const char *cal_apply(const char *key, const char *value_str, float *out_
 // ================================================================
 // COMMAND PROTOCOL — newline-terminated ASCII lines over UART0
 //     "T"          → re-tare all load cells and the current sensor
-//                    (TARE_STARTED now, TARE_DONE ~2 s later)
+//                    (TARE_STARTED now, TARE_DONE ~3 s later)
 //     "P<n>"       → link check; answered at once with PONG n plus the
 //                    counters above, so the PC can time the round trip
 //                    and knows its commands are actually arriving
@@ -1949,6 +2277,9 @@ static void measurement_task(void *arg) {
     int loop_n = 0;
     TickType_t last_wake = xTaskGetTickCount();
 
+    ads_stat_reset(&s_stat_a0);                                  // Start the first STATS window clean
+    ads_stat_reset(&s_stat_a1);
+
     while (1) {
         int64_t t_loop_start = esp_timer_get_time();
 
@@ -1971,10 +2302,11 @@ static void measurement_task(void *arg) {
         int64_t t_beam_done = esp_timer_get_time();
 
         float thrust_kg = read_thrust_kg();
-        float thrust_N  = thrust_kg * GRAVITY;
+        float thrust_N  = thrust_interp_N(thrust_kg * GRAVITY);   // Running-prop correction table (see THRUST INTERPOLATION TABLE)
         int64_t t_thrust_done = esp_timer_get_time();
 
         // Direction from S3, with hysteresis
+        bool ccw_before_frame = s_is_ccw;                    // Restored below if this frame's torque is a held spike
         if (kg[2] > TQ_HYST_KG) {
             s_is_ccw = false;
         } else if (kg[2] < -TQ_HYST_KG) {
@@ -2011,6 +2343,15 @@ static void measurement_task(void *arg) {
         voltage2_update(&voltage2_v);                                // voltage_v2: LV25-P on ADS1115 #2 A3
         int64_t t_ads_done = esp_timer_get_time();
 
+        // Spike gate: torque the DC input power cannot explain is replaced
+        // by the last plausible value (see TORQUE PLAUSIBILITY GATE).
+        bool  tq_held = false;
+        float tau_pub = torque_plausibility_gate(stable ? sv_tau : tau_Nm, rpm, current_amps, voltage_v, &tq_held);
+        if (tq_held) {
+            stable    = 0;                                   // Tell the dashboard/CSV this value is a hold
+            s_is_ccw  = ccw_before_frame;                    // A spike must not flip the CW/CCW table
+        }
+
         if (xSemaphoreTake(s_io_mutex, portMAX_DELAY) == pdTRUE) {
             printf("{\"torque\":%.4f,\"thrust\":%.3f,"
                    "\"s1\":%.3f,\"s2\":%.3f,\"s3\":%.3f,\"s4\":%.3f,"
@@ -2020,11 +2361,13 @@ static void measurement_task(void *arg) {
                    "\"current_a2\":%.2f,\"voltage_v2\":%.2f,"
                    "\"current_a3\":%.2f,\"current_a4\":%.2f,"
                    "\"throttle_us\":%d,\"seq\":%lu}\n",
-                   stable ? sv_tau : tau_Nm,
+                   tau_pub,
                    thrust_N,
                    kg[0], kg[1], kg[2], kg[3],
                    stable ? "true" : "false",
-                   s_is_ccw ? "CCW" : "CW",
+                   s_is_ccw ? "CW" : "CCW",                         // PRINTED LABEL ONLY, flipped to match the real prop rotation.
+                                                                    //   s_is_ccw itself still follows the S3 sign and still picks the
+                                                                    //   tq_cw / tq_ccw table, so the torque calibration is unchanged.
                    rpm,
                    rpm_raw,
                    current_amps,
@@ -2053,6 +2396,26 @@ static void measurement_task(void *arg) {
                      (long long)(t_rpm_done - t_thrust_done),
                      (long long)(t_ads_done - t_rpm_done),
                      (long long)(t_loop_end - t_ads_done));
+
+            // Raw A0/A1 statistics for this ~2 s window, then reset. The
+            // layout is parsed by rig_diag.py — keep the wording and the
+            // field order exactly as is. min/max print 0 when a channel
+            // had no samples (failed reads), instead of INT32 sentinels.
+            {
+                ads_stat_t a0 = s_stat_a0, a1 = s_stat_a1;
+                ads_stat_reset(&s_stat_a0);
+                ads_stat_reset(&s_stat_a1);
+                int  a0_min = a0.n ? (int)a0.mn : 0, a0_max = a0.n ? (int)a0.mx : 0;
+                int  a1_min = a1.n ? (int)a1.mn : 0, a1_max = a1.n ? (int)a1.mx : 0;
+                double a0_mean = a0.n ? (double)a0.sum / a0.n : 0.0;
+                double a1_mean = a1.n ? (double)a1.sum / a1.n : 0.0;
+                ESP_LOGI(TAG, "[ADS1 STATS 2s] A0 n=%d min=%d max=%d mean=%.1f span=%d despiked=%d | "
+                              "A1 n=%d min=%d max=%d mean=%.1f span=%d despiked=%d | not_ready=%lu",
+                         (int)a0.n, a0_min, a0_max, a0_mean, a0_max - a0_min, (int)a0.rej,
+                         (int)a1.n, a1_min, a1_max, a1_mean, a1_max - a1_min, (int)a1.rej,
+                         (unsigned long)s_ads_not_ready_first);
+            }
+
             // To re-derive VOLTAGE_SCALE (and NETWORK_GAIN/OFFSET if
             // needed) after the panel rebuild: apply a known,
             // multimeter-verified bus voltage, read the A0(V)
